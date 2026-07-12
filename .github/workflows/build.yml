@@ -1,0 +1,125 @@
+name: Build & Release HESAR
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: '1.22'
+  NODE_VERSION: '22'
+
+jobs:
+  build:
+    name: Build All
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+        env:
+          VITE_APP_VERSION: ${{ github.ref_name }}
+
+      - name: Copy frontend to backend
+        run: |
+          rm -rf backend/internal/api/dist
+          cp -r frontend/dist backend/internal/api/dist
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: backend/go.sum
+
+      - name: Build Linux amd64
+        working-directory: backend
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          go build \
+            -ldflags="-s -w -X main.Version=${{ github.ref_name }} -X main.BuildDate=$(date +%Y-%m-%d)" \
+            -o ../release/hesar-linux-amd64 \
+            cmd/hesar/main.go
+
+      - name: Build Linux arm64
+        working-directory: backend
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: '0'
+        run: |
+          go build \
+            -ldflags="-s -w -X main.Version=${{ github.ref_name }} -X main.BuildDate=$(date +%Y-%m-%d)" \
+            -o ../release/hesar-linux-arm64 \
+            cmd/hesar/main.go
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+
+          # Copy scripts and docs
+          cp scripts/hesar.sh release/
+          cp README.md release/
+          cp LICENSE release/
+
+          # Create archives
+          cd release
+          tar -czf ../hesar-linux-amd64.tar.gz hesar-linux-amd64 hesar.sh README.md LICENSE
+          tar -czf ../hesar-linux-arm64.tar.gz hesar-linux-arm64 hesar.sh README.md LICENSE
+          cd ..
+
+          # Checksums
+          sha256sum release/hesar-linux-amd64 release/hesar-linux-arm64 > checksums-sha256.txt
+
+      - name: Generate changelog
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | sed -n '2p')
+          echo "## What's Changed" > CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          if [ -z "$PREV_TAG" ]; then
+            echo "Initial release of HESAR Anti-DPI Tunnel Suite." >> CHANGELOG.md
+          else
+            git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" >> CHANGELOG.md
+          fi
+          echo "" >> CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          echo "## Quick Install" >> CHANGELOG.md
+          echo '```bash' >> CHANGELOG.md
+          echo 'bash <(curl -fsSL https://raw.githubusercontent.com/Meytiz/HESAR/main/scripts/hesar.sh)' >> CHANGELOG.md
+          echo '```' >> CHANGELOG.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "HESAR ${{ github.ref_name }}"
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
+          files: |
+            release/hesar-linux-amd64
+            release/hesar-linux-arm64
+            hesar-linux-amd64.tar.gz
+            hesar-linux-arm64.tar.gz
+            checksums-sha256.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

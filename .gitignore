@@ -1,0 +1,26 @@
+# Binaries and build outputs
+backend/hesar
+backend/hesar.exe
+backend/__debug_bin
+frontend/dist/
+node_modules/
+*.o
+*.so
+*.exe
+*.dll
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Config and local database storage
+data/
+config.json
+hesar.log
+*.log
+
+# Editor directories and files
+.vscode/
+.idea/
+*.swp
+*.swo

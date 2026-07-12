@@ -1,0 +1,381 @@
+package api
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/Meytiz/HESAR/backend/internal/config"
+	"github.com/Meytiz/HESAR/backend/internal/system"
+	"github.com/Meytiz/HESAR/backend/internal/tunnel"
+	"github.com/Meytiz/HESAR/backend/internal/tunnel/crypto"
+	"github.com/Meytiz/HESAR/backend/internal/tunnel/tester"
+	"github.com/gorilla/websocket"
+)
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+		return strings.Contains(origin, r.Host)
+	},
+}
+
+func generateSecureID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return "tunnel_" + hex.EncodeToString(b)
+}
+
+var validIDRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+func extractIDFromPath(path string) (string, error) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) < 3 {
+		return "", fmt.Errorf("invalid path")
+	}
+	id := parts[len(parts)-1]
+	if id == "start" || id == "stop" {
+		id = parts[len(parts)-2]
+	}
+	if !validIDRegex.MatchString(id) {
+		return "", fmt.Errorf("invalid tunnel ID format")
+	}
+	return id, nil
+}
+
+func maskKey(key string) string {
+	if len(key) <= 8 {
+		return "****"
+	}
+	return key[:4] + "****" + key[len(key)-4:]
+}
+
+func ConfigGetHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	cfg := config.GlobalConfig.GetConfig()
+	cfg.AdminPassword = ""
+	cfg.SecretKey = ""
+	for _, t := range cfg.Tunnels {
+		t.EncryptionKey = maskKey(t.EncryptionKey)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(cfg)
+}
+
+func ConfigUpdateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		AdminUsername string `json:"admin_username"`
+		AdminPassword string `json:"admin_password"`
+		LogPath       string `json:"log_path"`
+		LogMaxSizeMB  int    `json:"log_max_size_mb"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if err := config.GlobalConfig.UpdateSettings(req.AdminUsername, req.AdminPassword, req.LogPath, req.LogMaxSizeMB); err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if system.GlobalLogger != nil && req.LogPath != "" {
+		_ = system.GlobalLogger.UpdateConfig(req.LogPath, req.LogMaxSizeMB)
+	}
+	system.LogInfo("GUI Settings updated successfully")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"message": "Settings updated successfully"})
+}
+
+func TunnelsListHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	tunnels := config.GlobalConfig.GetTunnels()
+	for _, t := range tunnels {
+		t.EncryptionKey = maskKey(t.EncryptionKey)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(tunnels)
+}
+
+func TunnelSaveHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var t config.TunnelConfig
+	if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if t.ID == "" {
+		t.ID = generateSecureID()
+		if err := config.GlobalConfig.AddTunnel(&t); err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	} else {
+		if err := config.GlobalConfig.UpdateTunnel(&t); err != nil {
+			jsonError(w, err.Error(), http.StatusNotFound)
+			return
+		}
+	}
+	system.LogInfo("Tunnel [%s] saved successfully", t.Name)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(t)
+}
+
+func TunnelDeleteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := extractIDFromPath(r.URL.Path)
+	if err != nil {
+		jsonError(w, "invalid tunnel ID", http.StatusBadRequest)
+		return
+	}
+	_ = tunnel.GlobalTunnelManager.StopTunnel(id)
+	if err := config.GlobalConfig.DeleteTunnel(id); err != nil {
+		jsonError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	system.LogInfo("Tunnel ID [%s] deleted", id)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"message": "Tunnel deleted"})
+}
+
+func TunnelStartHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := extractIDFromPath(r.URL.Path)
+	if err != nil {
+		jsonError(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	t, err := config.GlobalConfig.GetTunnel(id)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if err := tunnel.GlobalTunnelManager.StartTunnel(t); err != nil {
+		jsonError(w, fmt.Sprintf("Failed to start tunnel: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"message": "Tunnel started"})
+}
+
+func TunnelStopHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := extractIDFromPath(r.URL.Path)
+	if err != nil {
+		jsonError(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	if err := tunnel.GlobalTunnelManager.StopTunnel(id); err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"message": "Tunnel stopped"})
+}
+
+func StatsGetHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	metrics := system.GetSystemMetrics()
+	tunnels := config.GlobalConfig.GetTunnels()
+	total := len(tunnels)
+	active := tunnel.GlobalTunnelManager.GetActiveTunnelsCount()
+	panelUptime := int64(time.Since(config.StartTime).Seconds())
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"total_tunnels":    total,
+		"active_tunnels":   active,
+		"inactive_tunnels": total - active,
+		"cpu_usage":        metrics.CPUUsage,
+		"memory_total":     metrics.MemoryTotal,
+		"memory_used":      metrics.MemoryUsed,
+		"memory_usage":     metrics.MemoryUsage,
+		"load_avg_1":       metrics.LoadAvg1,
+		"bbr_active":       metrics.BBRActive,
+		"panel_uptime":     panelUptime,
+	})
+}
+
+func OptimizeExecHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var warnings []string
+
+	if err := system.EnableBBR(); err != nil {
+		warnings = append(warnings, fmt.Sprintf("BBR: %v", err))
+	}
+
+	if err := system.OptimizeNetwork(); err != nil {
+		warnings = append(warnings, fmt.Sprintf("Network: %v", err))
+	}
+
+	bbrActive := system.CheckBBR()
+
+	if len(warnings) > 0 && !bbrActive {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":    false,
+			"bbr_active": bbrActive,
+			"message":    "Optimization requires root. Run: sudo ./hesar.sh --optimize",
+			"warnings":   warnings,
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":    true,
+		"bbr_active": bbrActive,
+		"message":    "Server Optimization & BBR applied successfully!",
+	})
+}
+
+func TesterSNIHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		TargetIP string `json:"target_ip"`
+		Port     int    `json:"port"`
+		SNI      string `json:"sni"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	res := tester.RunSNISpoofTest(req.TargetIP, req.Port, req.SNI)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
+}
+
+func TesterIPHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		TargetIP string `json:"target_ip"`
+		Port     int    `json:"port"`
+		FakeIP   string `json:"fake_ip"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	res := tester.RunIPSpoofTest(req.TargetIP, req.Port, req.FakeIP)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
+}
+
+func KeyGenHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	noiseKeys, err := crypto.GenerateX25519KeyPair()
+	if err != nil {
+		jsonError(w, "failed to generate key pair", http.StatusInternalServerError)
+		return
+	}
+	masterHex := crypto.GenerateRandomHexKey(32)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"noise_private_key": fmt.Sprintf("%x", noiseKeys.PrivateKey),
+		"noise_public_key":  fmt.Sprintf("%x", noiseKeys.PublicKey),
+		"encryption_key":    masterHex,
+	})
+}
+
+func LogsWebSocketHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		system.LogError("WebSocket upgrade failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		return nil
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if _, _, readErr := conn.ReadMessage(); readErr != nil {
+				break
+			}
+		}
+	}()
+
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	if system.GlobalLogger == nil {
+		_ = conn.WriteJSON(system.LogMessage{
+			Timestamp: time.Now().Format("2006-01-02 15:04:05"),
+			Level:     "WARN",
+			Message:   "Logger is not fully initialized.",
+		})
+		return
+	}
+
+	logCh := system.GlobalLogger.Subscribe()
+	defer system.GlobalLogger.Unsubscribe(logCh)
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		case msg, ok := <-logCh:
+			if !ok {
+				return
+			}
+			if err := conn.WriteJSON(msg); err != nil {
+				return
+			}
+		}
+	}
+}
