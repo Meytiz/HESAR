@@ -47,7 +47,11 @@ func applyKCPOptions(sess *kcp.UDPSession, mode string) {
 }
 
 func (h *KCPHandler) Start() error {
-	keyHash := sha256.Sum256([]byte(h.cfg.EncryptionKey))
+	// psk authenticates the ephemeral X25519 handshake performed inside
+	// crypto.NewSecureConn (see crypto.go) — it is never used directly
+	// as a symmetric encryption key. Session keys are derived from a
+	// fresh Diffie-Hellman exchange on every connection (forward secrecy).
+	psk := sha256.Sum256([]byte(h.cfg.EncryptionKey))
 	if h.cfg.Mode == "iran" {
 		ports, err := ParsePorts(h.cfg.LocalPorts)
 		if err != nil {
@@ -62,7 +66,7 @@ func (h *KCPHandler) Start() error {
 				return fmt.Errorf("KCP listen port %d: %w", port, err)
 			}
 			h.listeners = append(h.listeners, l)
-			go h.runIranListener(l, keyHash[:])
+			go h.runIranListener(l, psk[:])
 		}
 		h.mu.Unlock()
 		system.LogInfo("KCP Iran tunnel [%s] (mode: %s) started on ports: %s", h.cfg.Name, h.cfg.KCPMode, h.cfg.LocalPorts)
@@ -75,7 +79,7 @@ func (h *KCPHandler) Start() error {
 		h.mu.Lock()
 		h.listeners = append(h.listeners, l)
 		h.mu.Unlock()
-		go h.runOverseasListener(l, keyHash[:])
+		go h.runOverseasListener(l, psk[:])
 		system.LogInfo("KCP Overseas tunnel [%s] (mode: %s) started on UDP port: %d", h.cfg.Name, h.cfg.KCPMode, h.cfg.RemotePort)
 	} else {
 		return fmt.Errorf("unknown mode: %s", h.cfg.Mode)
@@ -94,7 +98,7 @@ func (h *KCPHandler) Stop() {
 	system.LogInfo("KCP tunnel [%s] stopped", h.cfg.Name)
 }
 
-func (h *KCPHandler) runIranListener(l net.Listener, masterKey []byte) {
+func (h *KCPHandler) runIranListener(l net.Listener, psk []byte) {
 	for {
 		clientConn, err := l.Accept()
 		if err != nil {
@@ -119,12 +123,23 @@ func (h *KCPHandler) runIranListener(l net.Listener, masterKey []byte) {
 			}
 			defer kcpConn.Close()
 			applyKCPOptions(kcpConn, h.cfg.KCPMode)
-			secureConn, err := crypto.NewSecureConn(kcpConn, masterKey, true)
+
+			// The X25519 handshake now performs a full read/write
+			// round-trip on kcpConn. Without an explicit deadline here,
+			// an unresponsive or malicious overseas peer could stall
+			// this goroutine indefinitely, leaking the KCP session and
+			// its underlying UDP resources. The deadline on `c` (the
+			// local Iran-side connection) does not cover I/O on
+			// kcpConn, which is a separate net.Conn.
+			_ = kcpConn.SetDeadline(time.Now().Add(10 * time.Second))
+			secureConn, err := crypto.NewSecureConn(kcpConn, psk, true)
 			if err != nil {
 				system.LogError("KCP Iran secure handshake: %v", err)
 				return
 			}
+			_ = kcpConn.SetDeadline(time.Time{})
 			defer secureConn.Close()
+
 			_ = c.SetDeadline(time.Time{})
 			ProxyBidirectional(c, secureConn, func(in, out int64) {
 				if config.GlobalConfig != nil {
@@ -135,7 +150,7 @@ func (h *KCPHandler) runIranListener(l net.Listener, masterKey []byte) {
 	}
 }
 
-func (h *KCPHandler) runOverseasListener(l net.Listener, masterKey []byte) {
+func (h *KCPHandler) runOverseasListener(l net.Listener, psk []byte) {
 	for {
 		incomingConn, err := l.Accept()
 		if err != nil {
@@ -154,8 +169,10 @@ func (h *KCPHandler) runOverseasListener(l net.Listener, masterKey []byte) {
 		}
 		go func(c net.Conn) {
 			defer c.Close()
+			// Deadline set before the handshake (read msg1, write msg2)
+			// is performed directly on c — already correct.
 			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
-			secureConn, err := crypto.NewSecureConn(c, masterKey, false)
+			secureConn, err := crypto.NewSecureConn(c, psk, false)
 			if err != nil {
 				system.LogError("KCP Overseas secure handshake: %v", err)
 				return

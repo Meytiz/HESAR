@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 env:
   GO_VERSION: '1.22'
@@ -72,23 +73,48 @@ jobs:
             -o ../release/hesar-linux-arm64 \
             cmd/hesar/main.go
 
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
       - name: Prepare release assets
         run: |
           mkdir -p release
 
-          # Copy scripts and docs
           cp scripts/hesar.sh release/
           cp README.md release/
           cp LICENSE release/
 
-          # Create archives
+          # Keep hesar.sh's displayed VERSION in perfect sync with the
+          # git tag this release was built from (same source of truth
+          # already used for -X main.Version above), instead of a
+          # manually-maintained constant inside the script that can
+          # silently drift out of date with every release.
+          # GITHUB_REF_NAME is an automatic Actions env var equal to the
+          # tag name (e.g. "v1.1.9"); strip the leading "v" to match the
+          # script's existing bare-number style ("1.0.0").
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/^VERSION=\".*\"/VERSION=\"${TAG_VERSION}\"/" release/hesar.sh
+
           cd release
           tar -czf ../hesar-linux-amd64.tar.gz hesar-linux-amd64 hesar.sh README.md LICENSE
           tar -czf ../hesar-linux-arm64.tar.gz hesar-linux-arm64 hesar.sh README.md LICENSE
           cd ..
 
-          # Checksums
-          sha256sum release/hesar-linux-amd64 release/hesar-linux-arm64 > checksums-sha256.txt
+          sha256sum release/hesar-linux-amd64 release/hesar-linux-arm64 release/hesar.sh > checksums-sha256.txt
+
+      - name: Sign checksum manifest and install script (cosign keyless)
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          cosign sign-blob --yes \
+            --output-signature checksums-sha256.txt.sig \
+            --output-certificate checksums-sha256.txt.pem \
+            checksums-sha256.txt
+
+          cosign sign-blob --yes \
+            --output-signature release/hesar.sh.sig \
+            --output-certificate release/hesar.sh.pem \
+            release/hesar.sh
 
       - name: Generate changelog
         run: |
@@ -106,6 +132,17 @@ jobs:
           echo '```bash' >> CHANGELOG.md
           echo 'bash <(curl -fsSL https://raw.githubusercontent.com/Meytiz/HESAR/main/scripts/hesar.sh)' >> CHANGELOG.md
           echo '```' >> CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          echo "## Verification" >> CHANGELOG.md
+          echo "Binaries and hesar.sh are hashed in checksums-sha256.txt, signed keylessly via cosign/Sigstore (GitHub Actions OIDC identity)." >> CHANGELOG.md
+          echo '```bash' >> CHANGELOG.md
+          echo 'cosign verify-blob \\' >> CHANGELOG.md
+          echo '  --certificate checksums-sha256.txt.pem \\' >> CHANGELOG.md
+          echo '  --signature checksums-sha256.txt.sig \\' >> CHANGELOG.md
+          echo '  --certificate-identity-regexp "^https://github.com/Meytiz/HESAR/.github/workflows/build.yml@refs/tags/.*$" \\' >> CHANGELOG.md
+          echo '  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \\' >> CHANGELOG.md
+          echo '  checksums-sha256.txt' >> CHANGELOG.md
+          echo '```' >> CHANGELOG.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -121,5 +158,9 @@ jobs:
             hesar-linux-amd64.tar.gz
             hesar-linux-arm64.tar.gz
             checksums-sha256.txt
+            checksums-sha256.txt.sig
+            checksums-sha256.txt.pem
+            release/hesar.sh.sig
+            release/hesar.sh.pem
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

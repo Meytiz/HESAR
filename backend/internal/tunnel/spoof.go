@@ -62,7 +62,9 @@ func CraftSpoofedIPHeader(fakeIP string) []byte {
 }
 
 func (h *IPSpoofHandler) Start() error {
-	keyHash := sha256.Sum256([]byte(h.cfg.EncryptionKey))
+	// psk authenticates the ephemeral X25519 handshake performed inside
+	// crypto.NewSecureConn — never used directly as an encryption key.
+	psk := sha256.Sum256([]byte(h.cfg.EncryptionKey))
 	fakeIP := h.cfg.FakeIP
 	if fakeIP == "" {
 		fakeIP = "185.10.20.30"
@@ -81,7 +83,7 @@ func (h *IPSpoofHandler) Start() error {
 				return fmt.Errorf("IP Spoof listen port %d: %w", port, err)
 			}
 			h.listeners = append(h.listeners, l)
-			go h.runIranListener(l, keyHash[:], fakeIP)
+			go h.runIranListener(l, psk[:], fakeIP)
 		}
 		h.mu.Unlock()
 		system.LogInfo("IP Spoof Iran tunnel [%s] (FakeIP: %s) started on ports: %s", h.cfg.Name, fakeIP, h.cfg.LocalPorts)
@@ -93,7 +95,7 @@ func (h *IPSpoofHandler) Start() error {
 		h.mu.Lock()
 		h.listeners = append(h.listeners, l)
 		h.mu.Unlock()
-		go h.runOverseasListener(l, keyHash[:])
+		go h.runOverseasListener(l, psk[:])
 		system.LogInfo("IP Spoof Overseas tunnel [%s] started on port: %d", h.cfg.Name, h.cfg.RemotePort)
 	} else {
 		return fmt.Errorf("unknown mode: %s", h.cfg.Mode)
@@ -112,7 +114,7 @@ func (h *IPSpoofHandler) Stop() {
 	system.LogInfo("IP Spoof tunnel [%s] stopped", h.cfg.Name)
 }
 
-func (h *IPSpoofHandler) runIranListener(l net.Listener, masterKey []byte, fakeIP string) {
+func (h *IPSpoofHandler) runIranListener(l net.Listener, psk []byte, fakeIP string) {
 	for {
 		clientConn, err := l.Accept()
 		if err != nil {
@@ -135,6 +137,16 @@ func (h *IPSpoofHandler) runIranListener(l net.Listener, masterKey []byte, fakeI
 				return
 			}
 			defer remoteConn.Close()
+
+			// A single deadline now covers the entire pre-proxy sequence
+			// on remoteConn: spoofed-header write, ACK read, and the
+			// X25519 handshake round-trip. Previously only `c` (the
+			// local listener connection) had a deadline — remoteConn
+			// itself had none, so a stalled overseas peer during the ACK
+			// read alone could already leak this goroutine/fd; the added
+			// handshake read makes this strictly worse without a fix.
+			_ = remoteConn.SetDeadline(time.Now().Add(10 * time.Second))
+
 			spoofHeader := CraftSpoofedIPHeader(fakeIP)
 			if _, err := remoteConn.Write(spoofHeader); err != nil {
 				system.LogError("IP Spoof Iran send header: %v", err)
@@ -145,12 +157,14 @@ func (h *IPSpoofHandler) runIranListener(l net.Listener, masterKey []byte, fakeI
 				system.LogError("IP Spoof Iran read ACK: %v", err)
 				return
 			}
-			secureConn, err := crypto.NewSecureConn(remoteConn, masterKey, true)
+			secureConn, err := crypto.NewSecureConn(remoteConn, psk, true)
 			if err != nil {
 				system.LogError("IP Spoof Iran secure handshake: %v", err)
 				return
 			}
+			_ = remoteConn.SetDeadline(time.Time{})
 			defer secureConn.Close()
+
 			_ = c.SetDeadline(time.Time{})
 			ProxyBidirectional(c, secureConn, func(in, out int64) {
 				if config.GlobalConfig != nil {
@@ -161,7 +175,7 @@ func (h *IPSpoofHandler) runIranListener(l net.Listener, masterKey []byte, fakeI
 	}
 }
 
-func (h *IPSpoofHandler) runOverseasListener(l net.Listener, masterKey []byte) {
+func (h *IPSpoofHandler) runOverseasListener(l net.Listener, psk []byte) {
 	for {
 		incomingConn, err := l.Accept()
 		if err != nil {
@@ -176,6 +190,8 @@ func (h *IPSpoofHandler) runOverseasListener(l net.Listener, masterKey []byte) {
 		}
 		go func(c net.Conn) {
 			defer c.Close()
+			// Deadline already covers header read, ACK write, and the
+			// handshake — all performed on c before proxying begins.
 			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
 			buf := make([]byte, 24)
 			if _, err := io.ReadFull(c, buf); err != nil {
@@ -187,7 +203,7 @@ func (h *IPSpoofHandler) runOverseasListener(l net.Listener, masterKey []byte) {
 				system.LogError("IP Spoof Overseas write ACK: %v", err)
 				return
 			}
-			secureConn, err := crypto.NewSecureConn(c, masterKey, false)
+			secureConn, err := crypto.NewSecureConn(c, psk, false)
 			if err != nil {
 				system.LogError("IP Spoof Overseas secure handshake: %v", err)
 				return

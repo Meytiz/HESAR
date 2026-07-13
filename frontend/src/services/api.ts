@@ -88,6 +88,15 @@ export const authService = {
   isAuthenticated: (): boolean => {
     return !!sessionStorage.getItem('hesar_token');
   },
+
+  // Issues a short-lived, single-use ticket for authenticating the
+  // WebSocket log stream. The JWT is sent normally via the Authorization
+  // header (attached by the request interceptor above) — it never
+  // appears in a URL, log file, or browser history.
+  getWsTicket: async (): Promise<string> => {
+    const res = await api.post('/auth/ws-ticket');
+    return res.data.ticket;
+  },
 };
 
 // ──────────────────────────────────────────────────
@@ -120,6 +129,7 @@ export const configService = {
     admin_password?: string;
     log_path?: string;
     log_max_size_mb?: number;
+    allowed_origins?: string[];
   }) => {
     const res = await api.post('/config', config);
     return res.data;
@@ -192,11 +202,15 @@ export const toolService = {
 };
 
 // ──────────────────────────────────────────────────
-// WebSocket Log Stream — ✅ auto-reconnect
+// WebSocket Log Stream — auto-reconnect, ticket-based auth
+//
+// No JWT is ever placed in the WebSocket URL. Each connection attempt
+// (initial and every reconnect) first requests a fresh, single-use,
+// ~30s-lived ticket via the authenticated REST endpoint, then opens the
+// socket with that ticket as the query parameter.
 // ──────────────────────────────────────────────────
 
 export const createLogWebSocket = (
-  token: string,
   onMessage: (msg: LogMessage) => void,
   onError?: (err: Event) => void
 ): (() => void) => {
@@ -204,12 +218,28 @@ export const createLogWebSocket = (
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
 
-  const connect = () => {
+  const scheduleReconnect = () => {
+    if (disposed) return;
+    reconnectTimer = setTimeout(connect, 3000);
+  };
+
+  const connect = async () => {
+    if (disposed) return;
+
+    let ticket: string;
+    try {
+      ticket = await authService.getWsTicket();
+    } catch (err) {
+      console.error('[HESAR] Failed to obtain WebSocket ticket:', err);
+      scheduleReconnect();
+      return;
+    }
+
     if (disposed) return;
 
     const protocol =
       window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${protocol}//${window.location.host}/api/logs?token=${encodeURIComponent(token)}`;
+    const url = `${protocol}//${window.location.host}/api/logs?ticket=${encodeURIComponent(ticket)}`;
 
     ws = new WebSocket(url);
 
@@ -231,7 +261,7 @@ export const createLogWebSocket = (
         console.log(
           '[HESAR] Log stream disconnected. Reconnecting in 3s...'
         );
-        reconnectTimer = setTimeout(connect, 3000);
+        scheduleReconnect();
       }
     };
 
@@ -243,7 +273,6 @@ export const createLogWebSocket = (
 
   connect();
 
-  // ✅ cleanup function
   return () => {
     disposed = true;
     if (reconnectTimer) clearTimeout(reconnectTimer);

@@ -15,7 +15,17 @@ import (
 )
 
 var (
-	Version   = "1.1.9"
+	// Version defaults to "dev" for any build that does not go through
+	// the official release pipeline (build.yml), which injects the real
+	// git tag via -ldflags "-X main.Version=...". A hardcoded semantic
+	// version like "1.1.9" here was misleading: a plain `go build` in a
+	// developer's checkout, a fork, or a CI job that forgets the ldflags
+	// step would silently report a fabricated official-looking version
+	// number, making bug reports and support requests unreliable ("user
+	// says v1.1.9 but the bug was fixed in v1.1.9... which commit is
+	// this actually running?"). "dev" makes an unofficial build
+	// immediately and unambiguously identifiable.
+	Version   = "dev"
 	BuildDate = "unknown"
 )
 
@@ -27,7 +37,12 @@ func main() {
 	flag.Parse()
 
 	if *showVer {
-		fmt.Printf("HESAR Reverse Tunnel Suite v%s (Built on %s)\n", Version, BuildDate)
+		// No forced "v" prefix here: official builds already receive the
+		// full tag (e.g. "v1.1.9") via ldflags, and unofficial builds
+		// show the literal "dev" default. Previously this printed
+		// "v%s" against a Version that itself started with "v" for
+		// official builds, producing a doubled "vv1.1.9".
+		fmt.Printf("HESAR Reverse Tunnel Suite %s (Built on %s)\n", Version, BuildDate)
 		os.Exit(0)
 	}
 
@@ -35,7 +50,7 @@ func main() {
 		fmt.Printf("[FATAL] Failed to initialize logger: %v\n", err)
 		os.Exit(1)
 	}
-	system.LogInfo("Starting HESAR Engine v%s...", Version)
+	system.LogInfo("Starting HESAR Engine %s...", Version)
 
 	if err := config.InitGlobalConfig(*configPath); err != nil {
 		system.LogError("Failed to initialize config: %v", err)

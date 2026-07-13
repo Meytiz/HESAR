@@ -29,6 +29,13 @@ REPO_URL="https://github.com/Meytiz/HESAR"
 VERSION="1.0.0"
 
 # ──────────────────────────────────────────────────
+# Cosign keyless signing parameters
+# (Must match identity of the GitHub Actions workflow that signs releases)
+# ──────────────────────────────────────────────────
+COSIGN_OIDC_ISSUER="https://token.actions.githubusercontent.com"
+COSIGN_IDENTITY_REGEXP="^https://github\.com/Meytiz/HESAR/\.github/workflows/build\.yml@refs/tags/.*$"
+
+# ──────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────
 get_public_ip() {
@@ -69,6 +76,156 @@ check_root() {
 press_enter() {
     echo ""
     read -rp "  Press Enter to return to menu..." _
+}
+
+# ──────────────────────────────────────────────────
+# Signature Verification (cosign keyless, tied to GH Actions OIDC identity)
+# ──────────────────────────────────────────────────
+verify_manifest_signature() {
+    local manifest_path="$1"
+    local sig_url="$2"
+    local pem_url="$3"
+
+    if ! command -v cosign >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}[WARN] cosign not installed - skipping signature verification.${NC}"
+        echo -e "  ${YELLOW}[WARN] Falling back to checksum-only integrity check.${NC}"
+        echo -e "  ${YELLOW}[WARN] Install cosign for full verification: https://docs.sigstore.dev/cosign/installation${NC}"
+        return 0
+    fi
+
+    local tmp_sig="/tmp/hesar-manifest-$$.sig"
+    local tmp_pem="/tmp/hesar-manifest-$$.pem"
+
+    if ! curl -fsSL --max-time 30 -o "${tmp_sig}" "${sig_url}"; then
+        echo -e "  ${RED}[ERROR] Failed to download signature file: ${sig_url}${NC}"
+        rm -f "${tmp_sig}" "${tmp_pem}"
+        return 1
+    fi
+    if ! curl -fsSL --max-time 30 -o "${tmp_pem}" "${pem_url}"; then
+        echo -e "  ${RED}[ERROR] Failed to download certificate file: ${pem_url}${NC}"
+        rm -f "${tmp_sig}" "${tmp_pem}"
+        return 1
+    fi
+
+    if cosign verify-blob \
+        --certificate "${tmp_pem}" \
+        --signature "${tmp_sig}" \
+        --certificate-identity-regexp "${COSIGN_IDENTITY_REGEXP}" \
+        --certificate-oidc-issuer "${COSIGN_OIDC_ISSUER}" \
+        "${manifest_path}" >/dev/null 2>&1; then
+        echo -e "  ${GREEN}---> Cosign signature verified. Manifest origin confirmed.${NC}"
+        rm -f "${tmp_sig}" "${tmp_pem}"
+        return 0
+    else
+        echo -e "  ${RED}[ERROR] Cosign signature verification FAILED.${NC}"
+        rm -f "${tmp_sig}" "${tmp_pem}"
+        return 1
+    fi
+}
+
+verify_checksum() {
+    local bin_path="$1"
+    local arch="$2"
+    local checksum_url="$3"
+    local tmp_checksum="/tmp/hesar-checksums-$$.txt"
+
+    echo -e "  ${YELLOW}---> Downloading checksum manifest...${NC}"
+
+    if ! curl -fsSL --connect-timeout 15 --retry 5 --retry-delay 3 --max-time 60 \
+        -o "${tmp_checksum}" "${checksum_url}"; then
+        echo -e "  ${RED}[ERROR] Failed to download checksum file: ${checksum_url}${NC}"
+        rm -f "${tmp_checksum}"
+        return 1
+    fi
+
+    if [ ! -s "${tmp_checksum}" ]; then
+        echo -e "  ${RED}[ERROR] Checksum file is empty.${NC}"
+        rm -f "${tmp_checksum}"
+        return 1
+    fi
+
+    if ! verify_manifest_signature "${tmp_checksum}" "${checksum_url}.sig" "${checksum_url}.pem"; then
+        echo -e "  ${RED}[ERROR] Refusing to trust unsigned/tampered checksum manifest.${NC}"
+        rm -f "${tmp_checksum}"
+        return 1
+    fi
+
+    local expected_hash
+    expected_hash=$(grep -E "hesar-linux-${arch}$" "${tmp_checksum}" | awk '{print $1}' | head -1)
+
+    if [ -z "${expected_hash}" ]; then
+        echo -e "  ${RED}[ERROR] No checksum entry found for hesar-linux-${arch}.${NC}"
+        rm -f "${tmp_checksum}"
+        return 1
+    fi
+
+    local actual_hash
+    actual_hash=$(sha256sum "${bin_path}" | awk '{print $1}')
+
+    rm -f "${tmp_checksum}"
+
+    if [ "${expected_hash}" != "${actual_hash}" ]; then
+        echo -e "  ${RED}[ERROR] CHECKSUM MISMATCH - possible tampering or corruption.${NC}"
+        echo -e "  ${RED}Expected: ${expected_hash}${NC}"
+        echo -e "  ${RED}Actual  : ${actual_hash}${NC}"
+        return 1
+    fi
+
+    echo -e "  ${GREEN}---> Checksum verified (sha256: ${actual_hash:0:16}...).${NC}"
+    return 0
+}
+
+# ──────────────────────────────────────────────────
+# Self Verification (verify hesar.sh against signed manifest before execution)
+# ──────────────────────────────────────────────────
+verify_self() {
+    local script_path="${1:-$0}"
+
+    if [ ! -f "${script_path}" ]; then
+        echo -e "  ${RED}[ERROR] Script file not found: ${script_path}${NC}"
+        echo -e "  ${YELLOW}Save the script to disk first, then run: $0 --verify-self <path>${NC}"
+        return 1
+    fi
+
+    echo -e "  ${YELLOW}---> Verifying integrity of: ${script_path}${NC}"
+
+    local checksum_url="${REPO_URL}/releases/latest/download/checksums-sha256.txt"
+    local tmp_checksum="/tmp/hesar-self-checksums-$$.txt"
+
+    if ! curl -fsSL --max-time 30 -o "${tmp_checksum}" "${checksum_url}"; then
+        echo -e "  ${RED}[ERROR] Failed to download checksum manifest.${NC}"
+        rm -f "${tmp_checksum}"
+        return 1
+    fi
+
+    if ! verify_manifest_signature "${tmp_checksum}" "${checksum_url}.sig" "${checksum_url}.pem"; then
+        echo -e "  ${RED}[ERROR] Refusing to trust unsigned/tampered checksum manifest.${NC}"
+        rm -f "${tmp_checksum}"
+        return 1
+    fi
+
+    local expected_hash
+    expected_hash=$(grep -E "hesar\.sh$" "${tmp_checksum}" | awk '{print $1}' | head -1)
+
+    if [ -z "${expected_hash}" ]; then
+        echo -e "  ${RED}[ERROR] No checksum entry found for hesar.sh.${NC}"
+        rm -f "${tmp_checksum}"
+        return 1
+    fi
+
+    local actual_hash
+    actual_hash=$(sha256sum "${script_path}" | awk '{print $1}')
+    rm -f "${tmp_checksum}"
+
+    if [ "${expected_hash}" != "${actual_hash}" ]; then
+        echo -e "  ${RED}[ERROR] SELF-VERIFICATION FAILED - script modified or not from an official release.${NC}"
+        echo -e "  ${RED}Expected: ${expected_hash}${NC}"
+        echo -e "  ${RED}Actual  : ${actual_hash}${NC}"
+        return 1
+    fi
+
+    echo -e "  ${GREEN}---> Script integrity verified (sha256: ${actual_hash:0:16}...).${NC}"
+    return 0
 }
 
 # ──────────────────────────────────────────────────
@@ -120,13 +277,23 @@ install_binaries() {
     else
         echo -e "  ${YELLOW}---> Downloading latest release...${NC}"
         local url="${REPO_URL}/releases/latest/download/hesar-linux-${BIN_ARCH}"
+        local checksum_url="${REPO_URL}/releases/latest/download/checksums-sha256.txt"
         rm -f "${INSTALL_DIR}/hesar"
 
         if curl -fSL --connect-timeout 20 --retry 10 --retry-delay 5 --max-time 300 -o "${INSTALL_DIR}/hesar" "${url}"; then
             echo -e "  ${GREEN}---> Downloaded successfully.${NC}"
 
-            # Verify it is a real ELF binary
-            if ! file "${INSTALL_DIR}/hesar" 2>/dev/null | grep -q "ELF"; then
+            if ! verify_checksum "${INSTALL_DIR}/hesar" "${BIN_ARCH}" "${checksum_url}"; then
+                rm -f "${INSTALL_DIR}/hesar"
+                echo -e "  ${RED}[ERROR] Aborting install - integrity check failed.${NC}"
+                echo -e "  ${YELLOW}---> Trying to build from source...${NC}"
+                if command -v go >/dev/null 2>&1 && [ -d "./backend" ]; then
+                    (cd backend && go build -ldflags="-s -w" -o "${INSTALL_DIR}/hesar" cmd/hesar/main.go)
+                else
+                    echo -e "  ${RED}[ERROR] Cannot obtain a verified binary.${NC}"
+                    return 1
+                fi
+            elif ! file "${INSTALL_DIR}/hesar" 2>/dev/null | grep -q "ELF"; then
                 echo -e "  ${RED}[ERROR] Downloaded file is not a valid binary.${NC}"
                 rm -f "${INSTALL_DIR}/hesar"
                 echo -e "  ${YELLOW}---> Trying to build from source...${NC}"
@@ -393,8 +560,10 @@ do_update() {
 
     echo -e "  ${YELLOW}---> Downloading new version (may take a while)...${NC}"
     local download_url="${REPO_URL}/releases/latest/download/hesar-linux-${BIN_ARCH}"
+    local checksum_url="${REPO_URL}/releases/latest/download/checksums-sha256.txt"
     if [ "$latest_tag" != "latest" ]; then
         download_url="${REPO_URL}/releases/download/${latest_tag}/hesar-linux-${BIN_ARCH}"
+        checksum_url="${REPO_URL}/releases/download/${latest_tag}/checksums-sha256.txt"
     fi
 
     local tmp_bin="/tmp/hesar-linux-${BIN_ARCH}"
@@ -433,6 +602,15 @@ do_update() {
         cp "${INSTALL_DIR}/hesar.bak" "${INSTALL_DIR}/hesar" 2>/dev/null || true
         systemctl start hesar 2>/dev/null || true
         echo -e "  ${RED}---> Update failed. Previous version restored.${NC}"
+        return 1
+    fi
+
+    if ! verify_checksum "${tmp_bin}" "${BIN_ARCH}" "${checksum_url}"; then
+        echo -e "  ${RED}[ERROR] Checksum verification failed. Aborting update.${NC}"
+        rm -f "${tmp_bin}"
+        cp "${INSTALL_DIR}/hesar.bak" "${INSTALL_DIR}/hesar" 2>/dev/null || true
+        systemctl start hesar 2>/dev/null || true
+        echo -e "  ${RED}---> Update aborted. Previous version restored.${NC}"
         return 1
     fi
 
@@ -626,17 +804,18 @@ main_menu() {
 # CLI Arguments
 # ──────────────────────────────────────────────────
 case "${1:-}" in
-    --quickstart) quick_start_install ;;
-    --core)       core_only_install ;;
-    --update)     do_update ;;
-    --check)      do_check_update ;;
-    --optimize)   server_optimize ;;
-    --uninstall)  uninstall_hesar ;;
-    --status)     do_status ;;
-    --logs)       do_logs ;;
-    "")           main_menu ;;
+    --quickstart)  quick_start_install ;;
+    --core)        core_only_install ;;
+    --update)      do_update ;;
+    --check)       do_check_update ;;
+    --optimize)    server_optimize ;;
+    --uninstall)   uninstall_hesar ;;
+    --status)      do_status ;;
+    --logs)        do_logs ;;
+    --verify-self) verify_self "${2:-$0}" ;;
+    "")            main_menu ;;
     *)
-        echo "Usage: $0 [--quickstart | --core | --update | --check | --optimize | --uninstall | --status | --logs]"
+        echo "Usage: $0 [--quickstart | --core | --update | --check | --optimize | --uninstall | --status | --logs | --verify-self <path>]"
         exit 1
         ;;
 esac

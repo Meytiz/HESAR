@@ -27,7 +27,14 @@ func NewTCPHandler(cfg *config.TunnelConfig) *TCPHandler {
 }
 
 func (h *TCPHandler) Start() error {
-	keyHash := sha256.Sum256([]byte(h.cfg.EncryptionKey))
+	// psk (pre-shared key) is derived from the configured EncryptionKey.
+	// It is used ONLY to authenticate the ephemeral X25519 handshake
+	// (via HMAC) and as additional HKDF input material — never directly
+	// as a static encryption key. Actual session keys are derived from a
+	// fresh ephemeral Diffie-Hellman exchange performed on every
+	// connection, giving true forward secrecy: compromise of the PSK
+	// does not allow decryption of previously recorded traffic.
+	psk := sha256.Sum256([]byte(h.cfg.EncryptionKey))
 	if h.cfg.Mode == "iran" {
 		ports, err := ParsePorts(h.cfg.LocalPorts)
 		if err != nil {
@@ -42,7 +49,7 @@ func (h *TCPHandler) Start() error {
 				return fmt.Errorf("TCP listen port %d: %w", port, err)
 			}
 			h.listeners = append(h.listeners, l)
-			go h.runIranListener(l, keyHash[:])
+			go h.runIranListener(l, psk[:])
 		}
 		h.mu.Unlock()
 		system.LogInfo("TCP Iran tunnel [%s] started on ports: %s", h.cfg.Name, h.cfg.LocalPorts)
@@ -54,7 +61,7 @@ func (h *TCPHandler) Start() error {
 		h.mu.Lock()
 		h.listeners = append(h.listeners, l)
 		h.mu.Unlock()
-		go h.runOverseasListener(l, keyHash[:])
+		go h.runOverseasListener(l, psk[:])
 		system.LogInfo("TCP Overseas tunnel [%s] started on port: %d", h.cfg.Name, h.cfg.RemotePort)
 	} else {
 		return fmt.Errorf("unknown mode: %s", h.cfg.Mode)
@@ -73,7 +80,7 @@ func (h *TCPHandler) Stop() {
 	system.LogInfo("TCP tunnel [%s] stopped", h.cfg.Name)
 }
 
-func (h *TCPHandler) runIranListener(l net.Listener, masterKey []byte) {
+func (h *TCPHandler) runIranListener(l net.Listener, psk []byte) {
 	for {
 		clientConn, err := l.Accept()
 		if err != nil {
@@ -96,12 +103,23 @@ func (h *TCPHandler) runIranListener(l net.Listener, masterKey []byte) {
 				return
 			}
 			defer remoteConn.Close()
-			secureConn, err := crypto.NewSecureConn(remoteConn, masterKey, true)
+
+			// The mutual X25519 handshake now performs a full round-trip
+			// (write msg1, read msg2) on remoteConn, unlike the old
+			// write-only salt exchange. A read/write deadline on
+			// remoteConn is required here, otherwise a hung/unresponsive
+			// overseas peer would block this goroutine (and leak the fd)
+			// indefinitely — the deadline on `c` above does not cover
+			// I/O performed on remoteConn.
+			_ = remoteConn.SetDeadline(time.Now().Add(10 * time.Second))
+			secureConn, err := crypto.NewSecureConn(remoteConn, psk, true)
 			if err != nil {
 				system.LogError("TCP Iran secure handshake: %v", err)
 				return
 			}
+			_ = remoteConn.SetDeadline(time.Time{})
 			defer secureConn.Close()
+
 			_ = c.SetDeadline(time.Time{})
 			ProxyBidirectional(c, secureConn, func(in, out int64) {
 				if config.GlobalConfig != nil {
@@ -112,7 +130,7 @@ func (h *TCPHandler) runIranListener(l net.Listener, masterKey []byte) {
 	}
 }
 
-func (h *TCPHandler) runOverseasListener(l net.Listener, masterKey []byte) {
+func (h *TCPHandler) runOverseasListener(l net.Listener, psk []byte) {
 	for {
 		incomingConn, err := l.Accept()
 		if err != nil {
@@ -127,8 +145,10 @@ func (h *TCPHandler) runOverseasListener(l net.Listener, masterKey []byte) {
 		}
 		go func(c net.Conn) {
 			defer c.Close()
+			// Deadline already covers the full mutual handshake
+			// (read msg1, write msg2) performed directly on c.
 			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
-			secureConn, err := crypto.NewSecureConn(c, masterKey, false)
+			secureConn, err := crypto.NewSecureConn(c, psk, false)
 			if err != nil {
 				system.LogError("TCP Overseas secure handshake: %v", err)
 				return
