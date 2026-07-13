@@ -10,9 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Meytiz/HESAR/backend/internal/config"
 	"github.com/Meytiz/HESAR/backend/internal/system"
-	"github.com/golang-jwt/jwt/v5"
 )
 
 //go:embed dist/*
@@ -22,6 +20,10 @@ func jsonError(w http.ResponseWriter, message string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
+func jsonEncode(w http.ResponseWriter, v interface{}) error {
+	return json.NewEncoder(w).Encode(v)
 }
 
 func StartServer(ctx context.Context, port int) error {
@@ -35,6 +37,11 @@ func StartServer(ctx context.Context, port int) error {
 	mux.HandleFunc("/api/auth/status", StatusHandler)
 	mux.HandleFunc("/api/auth/login", LoginHandler)
 	mux.HandleFunc("/api/auth/logout", LogoutHandler)
+
+	// Issues short-lived WebSocket tickets. Requires a valid JWT
+	// (Authorization: Bearer ...) exactly like every other protected
+	// REST endpoint — the JWT itself never appears in a URL.
+	mux.Handle("/api/auth/ws-ticket", AuthMiddleware(http.HandlerFunc(WSTicketHandler)))
 
 	mux.Handle("/api/config", AuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -78,20 +85,12 @@ func StartServer(ctx context.Context, port int) error {
 	mux.Handle("/api/tester/ip", AuthMiddleware(http.HandlerFunc(TesterIPHandler)))
 	mux.Handle("/api/keygen", AuthMiddleware(http.HandlerFunc(KeyGenHandler)))
 
+	// The log stream is authenticated via a short-lived, single-use
+	// ticket obtained beforehand from /api/auth/ws-ticket (JWT-protected).
+	// No JWT is ever placed in this URL.
 	mux.HandleFunc("/api/logs", func(w http.ResponseWriter, r *http.Request) {
-		token := r.URL.Query().Get("token")
-		if token == "" {
-			jsonError(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		secret := config.GlobalConfig.GetConfig().SecretKey
-		parsedToken, err := jwt.Parse(token, func(t *jwt.Token) (interface{}, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-			}
-			return []byte(secret), nil
-		})
-		if err != nil || !parsedToken.Valid {
+		ticket := r.URL.Query().Get("ticket")
+		if !wsTickets.consume(ticket, clientIP(r)) {
 			jsonError(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}

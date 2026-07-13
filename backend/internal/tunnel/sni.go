@@ -71,7 +71,9 @@ func MakeFakeTLSClientHello(sni string) []byte {
 }
 
 func (h *SNISpoofHandler) Start() error {
-	keyHash := sha256.Sum256([]byte(h.cfg.EncryptionKey))
+	// psk authenticates the ephemeral X25519 handshake performed inside
+	// crypto.NewSecureConn — never used directly as an encryption key.
+	psk := sha256.Sum256([]byte(h.cfg.EncryptionKey))
 	sni := h.cfg.SpoofSNI
 	if sni == "" {
 		sni = "www.aparat.com"
@@ -90,7 +92,7 @@ func (h *SNISpoofHandler) Start() error {
 				return fmt.Errorf("SNI Spoof listen port %d: %w", port, err)
 			}
 			h.listeners = append(h.listeners, l)
-			go h.runIranListener(l, keyHash[:], sni)
+			go h.runIranListener(l, psk[:], sni)
 		}
 		h.mu.Unlock()
 		system.LogInfo("SNI Spoof Iran tunnel [%s] (SNI: %s) started on ports: %s", h.cfg.Name, sni, h.cfg.LocalPorts)
@@ -102,7 +104,7 @@ func (h *SNISpoofHandler) Start() error {
 		h.mu.Lock()
 		h.listeners = append(h.listeners, l)
 		h.mu.Unlock()
-		go h.runOverseasListener(l, keyHash[:])
+		go h.runOverseasListener(l, psk[:])
 		system.LogInfo("SNI Spoof Overseas tunnel [%s] started on port: %d", h.cfg.Name, h.cfg.RemotePort)
 	} else {
 		return fmt.Errorf("unknown mode: %s", h.cfg.Mode)
@@ -121,7 +123,7 @@ func (h *SNISpoofHandler) Stop() {
 	system.LogInfo("SNI Spoof tunnel [%s] stopped", h.cfg.Name)
 }
 
-func (h *SNISpoofHandler) runIranListener(l net.Listener, masterKey []byte, sni string) {
+func (h *SNISpoofHandler) runIranListener(l net.Listener, psk []byte, sni string) {
 	for {
 		clientConn, err := l.Accept()
 		if err != nil {
@@ -144,6 +146,12 @@ func (h *SNISpoofHandler) runIranListener(l net.Listener, masterKey []byte, sni 
 				return
 			}
 			defer remoteConn.Close()
+
+			// Covers ClientHello write, ACK read, and the X25519
+			// handshake round-trip on remoteConn. Same rationale as
+			// spoof.go: remoteConn previously had no deadline at all.
+			_ = remoteConn.SetDeadline(time.Now().Add(10 * time.Second))
+
 			hello := MakeFakeTLSClientHello(sni)
 			if _, err := remoteConn.Write(hello); err != nil {
 				system.LogError("SNI Spoof Iran send ClientHello: %v", err)
@@ -154,12 +162,14 @@ func (h *SNISpoofHandler) runIranListener(l net.Listener, masterKey []byte, sni 
 				system.LogError("SNI Spoof Iran read ACK: %v", err)
 				return
 			}
-			secureConn, err := crypto.NewSecureConn(remoteConn, masterKey, true)
+			secureConn, err := crypto.NewSecureConn(remoteConn, psk, true)
 			if err != nil {
 				system.LogError("SNI Spoof Iran secure handshake: %v", err)
 				return
 			}
+			_ = remoteConn.SetDeadline(time.Time{})
 			defer secureConn.Close()
+
 			_ = c.SetDeadline(time.Time{})
 			ProxyBidirectional(c, secureConn, func(in, out int64) {
 				if config.GlobalConfig != nil {
@@ -170,7 +180,7 @@ func (h *SNISpoofHandler) runIranListener(l net.Listener, masterKey []byte, sni 
 	}
 }
 
-func (h *SNISpoofHandler) runOverseasListener(l net.Listener, masterKey []byte) {
+func (h *SNISpoofHandler) runOverseasListener(l net.Listener, psk []byte) {
 	helloLen := len(MakeFakeTLSClientHello("www.aparat.com"))
 	for {
 		incomingConn, err := l.Accept()
@@ -186,6 +196,8 @@ func (h *SNISpoofHandler) runOverseasListener(l net.Listener, masterKey []byte) 
 		}
 		go func(c net.Conn) {
 			defer c.Close()
+			// Deadline already covers ClientHello read, ACK write, and
+			// the handshake — all performed on c before proxying begins.
 			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
 			buf := make([]byte, helloLen)
 			if _, err := io.ReadFull(c, buf); err != nil {
@@ -197,7 +209,7 @@ func (h *SNISpoofHandler) runOverseasListener(l net.Listener, masterKey []byte) 
 				system.LogError("SNI Spoof Overseas write ACK: %v", err)
 				return
 			}
-			secureConn, err := crypto.NewSecureConn(c, masterKey, false)
+			secureConn, err := crypto.NewSecureConn(c, psk, false)
 			if err != nil {
 				system.LogError("SNI Spoof Overseas secure handshake: %v", err)
 				return

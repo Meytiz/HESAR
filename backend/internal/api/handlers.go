@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -21,13 +22,71 @@ import (
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
+	CheckOrigin:     isOriginAllowed,
+}
+
+// isOriginAllowed enforces an exact-match Origin check to prevent
+// Cross-Site WebSocket Hijacking. A request is accepted only if:
+//   - it has no Origin header (non-browser / same-process clients), or
+//   - the Origin's host exactly equals the request Host (scheme-agnostic
+//     same-origin case), or
+//   - the full Origin (scheme://host[:port]) exactly matches an entry
+//     in the configured allowlist.
+//
+// Substring/Contains matching is intentionally NOT used: it allows
+// attacker-controlled origins such as "https://evil.com/?host=panel.example.com"
+// or "https://panel.example.com.evil.com" to pass a naive check.
+func isOriginAllowed(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		system.LogWarn("WebSocket upgrade rejected: unparsable Origin %q", origin)
+		return false
+	}
+
+	if strings.EqualFold(u.Host, r.Host) {
+		return true
+	}
+
+	for _, allowed := range config.GlobalConfig.GetAllowedOrigins() {
+		allowedURL, err := url.Parse(allowed)
+		if err != nil {
+			continue
+		}
+		if strings.EqualFold(u.Scheme, allowedURL.Scheme) && strings.EqualFold(u.Host, allowedURL.Host) {
 			return true
 		}
-		return strings.Contains(origin, r.Host)
-	},
+	}
+
+	system.LogWarn("WebSocket upgrade rejected: Origin %q not allowed for Host %q", origin, r.Host)
+	return false
+}
+
+// validateOriginEntry ensures each configured allowlist entry is an
+// absolute URL of the form scheme://host[:port] with no path, query,
+// or fragment — preventing ambiguous or overly-broad entries.
+func validateOriginEntry(raw string) error {
+	if raw == "" {
+		return fmt.Errorf("origin entry cannot be empty")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid origin %q: %v", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("invalid origin %q: scheme must be http or https", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("invalid origin %q: missing host", raw)
+	}
+	if u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("invalid origin %q: must be scheme://host[:port] only", raw)
+	}
+	return nil
 }
 
 func generateSecureID() string {
@@ -81,10 +140,11 @@ func ConfigUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		AdminUsername string `json:"admin_username"`
-		AdminPassword string `json:"admin_password"`
-		LogPath       string `json:"log_path"`
-		LogMaxSizeMB  int    `json:"log_max_size_mb"`
+		AdminUsername  string   `json:"admin_username"`
+		AdminPassword  string   `json:"admin_password"`
+		LogPath        string   `json:"log_path"`
+		LogMaxSizeMB   int      `json:"log_max_size_mb"`
+		AllowedOrigins []string `json:"allowed_origins"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "invalid request body", http.StatusBadRequest)
@@ -93,6 +153,19 @@ func ConfigUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	if err := config.GlobalConfig.UpdateSettings(req.AdminUsername, req.AdminPassword, req.LogPath, req.LogMaxSizeMB); err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if req.AllowedOrigins != nil {
+		for _, o := range req.AllowedOrigins {
+			if err := validateOriginEntry(o); err != nil {
+				jsonError(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		if err := config.GlobalConfig.SetAllowedOrigins(req.AllowedOrigins); err != nil {
+			jsonError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		system.LogInfo("GUI Allowed WebSocket origins updated (%d entries)", len(req.AllowedOrigins))
 	}
 	if system.GlobalLogger != nil && req.LogPath != "" {
 		_ = system.GlobalLogger.UpdateConfig(req.LogPath, req.LogMaxSizeMB)
@@ -313,7 +386,11 @@ func KeyGenHandler(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "failed to generate key pair", http.StatusInternalServerError)
 		return
 	}
-	masterHex := crypto.GenerateRandomHexKey(32)
+	masterHex, err := crypto.GenerateRandomHexKey(32)
+	if err != nil {
+		jsonError(w, "failed to generate random key", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"noise_private_key": fmt.Sprintf("%x", noiseKeys.PrivateKey),
