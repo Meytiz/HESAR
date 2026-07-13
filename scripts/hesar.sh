@@ -26,7 +26,7 @@ SYSTEMD_FILE="/etc/systemd/system/hesar.service"
 SYSCTL_FILE="/etc/sysctl.d/99-hesar-tune.conf"
 HESAR_USER="hesar"
 REPO_URL="https://github.com/Meytiz/HESAR"
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # ──────────────────────────────────────────────────
 # Cosign keyless signing parameters
