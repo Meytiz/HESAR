@@ -20,11 +20,14 @@ type KCPHandler struct {
 	cancel    context.CancelFunc
 	listeners []net.Listener
 	mu        sync.Mutex
+	// pool bounds how many connections may be simultaneously dialing out
+	// and performing the secure handshake (see pool.go).
+	pool *ConnPool
 }
 
 func NewKCPHandler(cfg *config.TunnelConfig) *KCPHandler {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &KCPHandler{cfg: cfg, ctx: ctx, cancel: cancel}
+	return &KCPHandler{cfg: cfg, ctx: ctx, cancel: cancel, pool: NewConnPool(DefaultMaxConcurrentHandshakes)}
 }
 
 func applyKCPOptions(sess *kcp.UDPSession, mode string) {
@@ -48,9 +51,9 @@ func applyKCPOptions(sess *kcp.UDPSession, mode string) {
 
 func (h *KCPHandler) Start() error {
 	// psk authenticates the ephemeral X25519 handshake performed inside
-	// crypto.NewSecureConn (see crypto.go) — it is never used directly
-	// as a symmetric encryption key. Session keys are derived from a
-	// fresh Diffie-Hellman exchange on every connection (forward secrecy).
+	// crypto.NewSecureConn (see crypto.go) — it is never used directly as
+	// a symmetric encryption key. Session keys are derived from a fresh
+	// Diffie-Hellman exchange on every connection (forward secrecy).
 	psk := sha256.Sum256([]byte(h.cfg.EncryptionKey))
 	if h.cfg.Mode == "iran" {
 		ports, err := ParsePorts(h.cfg.LocalPorts)
@@ -113,6 +116,19 @@ func (h *KCPHandler) runIranListener(l net.Listener, psk []byte) {
 		}
 		go func(c net.Conn) {
 			defer c.Close()
+
+			if err := h.pool.Acquire(h.ctx); err != nil {
+				return
+			}
+			released := false
+			release := func() {
+				if !released {
+					released = true
+					h.pool.Release()
+				}
+			}
+			defer release()
+
 			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
 			remoteAddr := fmt.Sprintf("%s:%d", h.cfg.RemoteIP, h.cfg.RemotePort)
 			block, _ := kcp.NewNoneBlockCrypt(nil)
@@ -124,13 +140,11 @@ func (h *KCPHandler) runIranListener(l net.Listener, psk []byte) {
 			defer kcpConn.Close()
 			applyKCPOptions(kcpConn, h.cfg.KCPMode)
 
-			// The X25519 handshake now performs a full read/write
-			// round-trip on kcpConn. Without an explicit deadline here,
-			// an unresponsive or malicious overseas peer could stall
-			// this goroutine indefinitely, leaking the KCP session and
-			// its underlying UDP resources. The deadline on `c` (the
-			// local Iran-side connection) does not cover I/O on
-			// kcpConn, which is a separate net.Conn.
+			// The X25519 handshake performs a full read/write round-trip
+			// on kcpConn. Without an explicit deadline here, an
+			// unresponsive or malicious overseas peer could stall this
+			// goroutine indefinitely, leaking the KCP session, its
+			// underlying UDP resources, and its pool slot.
 			_ = kcpConn.SetDeadline(time.Now().Add(10 * time.Second))
 			secureConn, err := crypto.NewSecureConn(kcpConn, psk, true)
 			if err != nil {
@@ -139,6 +153,8 @@ func (h *KCPHandler) runIranListener(l net.Listener, psk []byte) {
 			}
 			_ = kcpConn.SetDeadline(time.Time{})
 			defer secureConn.Close()
+
+			release()
 
 			_ = c.SetDeadline(time.Time{})
 			ProxyBidirectional(c, secureConn, func(in, out int64) {
@@ -169,6 +185,19 @@ func (h *KCPHandler) runOverseasListener(l net.Listener, psk []byte) {
 		}
 		go func(c net.Conn) {
 			defer c.Close()
+
+			if err := h.pool.Acquire(h.ctx); err != nil {
+				return
+			}
+			released := false
+			release := func() {
+				if !released {
+					released = true
+					h.pool.Release()
+				}
+			}
+			defer release()
+
 			// Deadline set before the handshake (read msg1, write msg2)
 			// is performed directly on c — already correct.
 			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
@@ -185,6 +214,9 @@ func (h *KCPHandler) runOverseasListener(l net.Listener, psk []byte) {
 				return
 			}
 			defer targetConn.Close()
+
+			release()
+
 			_ = c.SetDeadline(time.Time{})
 			ProxyBidirectional(secureConn, targetConn, func(in, out int64) {
 				if config.GlobalConfig != nil {

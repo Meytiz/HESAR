@@ -19,11 +19,15 @@ type TCPHandler struct {
 	cancel    context.CancelFunc
 	listeners []net.Listener
 	mu        sync.Mutex
+	// pool bounds how many connections may be simultaneously dialing out
+	// and performing the secure handshake (see pool.go). It does NOT
+	// limit the number of already-established, long-lived tunnel sessions.
+	pool *ConnPool
 }
 
 func NewTCPHandler(cfg *config.TunnelConfig) *TCPHandler {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &TCPHandler{cfg: cfg, ctx: ctx, cancel: cancel}
+	return &TCPHandler{cfg: cfg, ctx: ctx, cancel: cancel, pool: NewConnPool(DefaultMaxConcurrentHandshakes)}
 }
 
 func (h *TCPHandler) Start() error {
@@ -93,8 +97,28 @@ func (h *TCPHandler) runIranListener(l net.Listener, psk []byte) {
 				continue
 			}
 		}
+		// Accept() is never blocked: the connection is immediately handed
+		// off to a new goroutine. Concurrency is capped *inside* that
+		// goroutine by acquiring a pool slot before dialing out, so at
+		// most DefaultMaxConcurrentHandshakes dial+handshake sequences run
+		// at the same time; anything beyond that queues here
+		// asynchronously until a slot frees up (thread-pool + async
+		// semantics, bounded parallel workers, unbounded backlog).
 		go func(c net.Conn) {
 			defer c.Close()
+
+			if err := h.pool.Acquire(h.ctx); err != nil {
+				return // tunnel stopped while waiting for a free slot
+			}
+			released := false
+			release := func() {
+				if !released {
+					released = true
+					h.pool.Release()
+				}
+			}
+			defer release()
+
 			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
 			remoteAddr := fmt.Sprintf("%s:%d", h.cfg.RemoteIP, h.cfg.RemotePort)
 			remoteConn, err := net.DialTimeout("tcp", remoteAddr, 10*time.Second)
@@ -104,13 +128,11 @@ func (h *TCPHandler) runIranListener(l net.Listener, psk []byte) {
 			}
 			defer remoteConn.Close()
 
-			// The mutual X25519 handshake now performs a full round-trip
-			// (write msg1, read msg2) on remoteConn, unlike the old
-			// write-only salt exchange. A read/write deadline on
-			// remoteConn is required here, otherwise a hung/unresponsive
-			// overseas peer would block this goroutine (and leak the fd)
-			// indefinitely — the deadline on `c` above does not cover
-			// I/O performed on remoteConn.
+			// The mutual X25519 handshake performs a full round-trip
+			// (write msg1, read msg2) on remoteConn. A read/write deadline
+			// on remoteConn is required here, otherwise a hung/unresponsive
+			// overseas peer would block this goroutine (and leak the fd,
+			// and its pool slot) indefinitely.
 			_ = remoteConn.SetDeadline(time.Now().Add(10 * time.Second))
 			secureConn, err := crypto.NewSecureConn(remoteConn, psk, true)
 			if err != nil {
@@ -119,6 +141,12 @@ func (h *TCPHandler) runIranListener(l net.Listener, psk []byte) {
 			}
 			_ = remoteConn.SetDeadline(time.Time{})
 			defer secureConn.Close()
+
+			// Handshake succeeded — release the pool slot *before*
+			// entering the potentially long-lived proxy loop, so
+			// already-established sessions never starve new connections
+			// that are waiting for a free handshake slot.
+			release()
 
 			_ = c.SetDeadline(time.Time{})
 			ProxyBidirectional(c, secureConn, func(in, out int64) {
@@ -145,6 +173,19 @@ func (h *TCPHandler) runOverseasListener(l net.Listener, psk []byte) {
 		}
 		go func(c net.Conn) {
 			defer c.Close()
+
+			if err := h.pool.Acquire(h.ctx); err != nil {
+				return
+			}
+			released := false
+			release := func() {
+				if !released {
+					released = true
+					h.pool.Release()
+				}
+			}
+			defer release()
+
 			// Deadline already covers the full mutual handshake
 			// (read msg1, write msg2) performed directly on c.
 			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
@@ -161,6 +202,9 @@ func (h *TCPHandler) runOverseasListener(l net.Listener, psk []byte) {
 				return
 			}
 			defer targetConn.Close()
+
+			release()
+
 			_ = c.SetDeadline(time.Time{})
 			ProxyBidirectional(secureConn, targetConn, func(in, out int64) {
 				if config.GlobalConfig != nil {

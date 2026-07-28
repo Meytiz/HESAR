@@ -21,11 +21,14 @@ type IPSpoofHandler struct {
 	cancel    context.CancelFunc
 	listeners []net.Listener
 	mu        sync.Mutex
+	// pool bounds how many connections may be simultaneously dialing out
+	// and performing the secure handshake (see pool.go).
+	pool *ConnPool
 }
 
 func NewIPSpoofHandler(cfg *config.TunnelConfig) *IPSpoofHandler {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &IPSpoofHandler{cfg: cfg, ctx: ctx, cancel: cancel}
+	return &IPSpoofHandler{cfg: cfg, ctx: ctx, cancel: cancel, pool: NewConnPool(DefaultMaxConcurrentHandshakes)}
 }
 
 func CraftSpoofedIPHeader(fakeIP string) []byte {
@@ -129,6 +132,19 @@ func (h *IPSpoofHandler) runIranListener(l net.Listener, psk []byte, fakeIP stri
 		}
 		go func(c net.Conn) {
 			defer c.Close()
+
+			if err := h.pool.Acquire(h.ctx); err != nil {
+				return
+			}
+			released := false
+			release := func() {
+				if !released {
+					released = true
+					h.pool.Release()
+				}
+			}
+			defer release()
+
 			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
 			remoteAddr := fmt.Sprintf("%s:%d", h.cfg.RemoteIP, h.cfg.RemotePort)
 			remoteConn, err := net.DialTimeout("tcp", remoteAddr, 10*time.Second)
@@ -138,13 +154,9 @@ func (h *IPSpoofHandler) runIranListener(l net.Listener, psk []byte, fakeIP stri
 			}
 			defer remoteConn.Close()
 
-			// A single deadline now covers the entire pre-proxy sequence
-			// on remoteConn: spoofed-header write, ACK read, and the
-			// X25519 handshake round-trip. Previously only `c` (the
-			// local listener connection) had a deadline — remoteConn
-			// itself had none, so a stalled overseas peer during the ACK
-			// read alone could already leak this goroutine/fd; the added
-			// handshake read makes this strictly worse without a fix.
+			// A single deadline covers the entire pre-proxy sequence on
+			// remoteConn: spoofed-header write, ACK read, and the X25519
+			// handshake round-trip.
 			_ = remoteConn.SetDeadline(time.Now().Add(10 * time.Second))
 
 			spoofHeader := CraftSpoofedIPHeader(fakeIP)
@@ -164,6 +176,8 @@ func (h *IPSpoofHandler) runIranListener(l net.Listener, psk []byte, fakeIP stri
 			}
 			_ = remoteConn.SetDeadline(time.Time{})
 			defer secureConn.Close()
+
+			release()
 
 			_ = c.SetDeadline(time.Time{})
 			ProxyBidirectional(c, secureConn, func(in, out int64) {
@@ -190,6 +204,19 @@ func (h *IPSpoofHandler) runOverseasListener(l net.Listener, psk []byte) {
 		}
 		go func(c net.Conn) {
 			defer c.Close()
+
+			if err := h.pool.Acquire(h.ctx); err != nil {
+				return
+			}
+			released := false
+			release := func() {
+				if !released {
+					released = true
+					h.pool.Release()
+				}
+			}
+			defer release()
+
 			// Deadline already covers header read, ACK write, and the
 			// handshake — all performed on c before proxying begins.
 			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
@@ -216,6 +243,9 @@ func (h *IPSpoofHandler) runOverseasListener(l net.Listener, psk []byte) {
 				return
 			}
 			defer targetConn.Close()
+
+			release()
+
 			_ = c.SetDeadline(time.Time{})
 			ProxyBidirectional(secureConn, targetConn, func(in, out int64) {
 				if config.GlobalConfig != nil {

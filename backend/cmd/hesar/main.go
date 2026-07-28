@@ -14,21 +14,6 @@ import (
 	"github.com/Meytiz/HESAR/backend/internal/tunnel"
 )
 
-var (
-	// Version defaults to "dev" for any build that does not go through
-	// the official release pipeline (build.yml), which injects the real
-	// git tag via -ldflags "-X main.Version=...". A hardcoded semantic
-	// version like "1.1.9" here was misleading: a plain `go build` in a
-	// developer's checkout, a fork, or a CI job that forgets the ldflags
-	// step would silently report a fabricated official-looking version
-	// number, making bug reports and support requests unreliable ("user
-	// says v1.1.9 but the bug was fixed in v1.1.9... which commit is
-	// this actually running?"). "dev" makes an unofficial build
-	// immediately and unambiguously identifiable.
-	Version   = "dev"
-	BuildDate = "unknown"
-)
-
 func main() {
 	configPath := flag.String("config", "data/config.json", "Path to configuration JSON")
 	portOverride := flag.Int("port", 0, "Override GUI listen port")

@@ -22,11 +22,14 @@ type SNISpoofHandler struct {
 	cancel    context.CancelFunc
 	listeners []net.Listener
 	mu        sync.Mutex
+	// pool bounds how many connections may be simultaneously dialing out
+	// and performing the secure handshake (see pool.go).
+	pool *ConnPool
 }
 
 func NewSNISpoofHandler(cfg *config.TunnelConfig) *SNISpoofHandler {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &SNISpoofHandler{cfg: cfg, ctx: ctx, cancel: cancel}
+	return &SNISpoofHandler{cfg: cfg, ctx: ctx, cancel: cancel, pool: NewConnPool(DefaultMaxConcurrentHandshakes)}
 }
 
 func MakeFakeTLSClientHello(sni string) []byte {
@@ -138,6 +141,19 @@ func (h *SNISpoofHandler) runIranListener(l net.Listener, psk []byte, sni string
 		}
 		go func(c net.Conn) {
 			defer c.Close()
+
+			if err := h.pool.Acquire(h.ctx); err != nil {
+				return
+			}
+			released := false
+			release := func() {
+				if !released {
+					released = true
+					h.pool.Release()
+				}
+			}
+			defer release()
+
 			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
 			remoteAddr := fmt.Sprintf("%s:%d", h.cfg.RemoteIP, h.cfg.RemotePort)
 			remoteConn, err := net.DialTimeout("tcp", remoteAddr, 10*time.Second)
@@ -147,9 +163,8 @@ func (h *SNISpoofHandler) runIranListener(l net.Listener, psk []byte, sni string
 			}
 			defer remoteConn.Close()
 
-			// Covers ClientHello write, ACK read, and the X25519
-			// handshake round-trip on remoteConn. Same rationale as
-			// spoof.go: remoteConn previously had no deadline at all.
+			// Covers ClientHello write, ACK read, and the X25519 handshake
+			// round-trip on remoteConn.
 			_ = remoteConn.SetDeadline(time.Now().Add(10 * time.Second))
 
 			hello := MakeFakeTLSClientHello(sni)
@@ -169,6 +184,8 @@ func (h *SNISpoofHandler) runIranListener(l net.Listener, psk []byte, sni string
 			}
 			_ = remoteConn.SetDeadline(time.Time{})
 			defer secureConn.Close()
+
+			release()
 
 			_ = c.SetDeadline(time.Time{})
 			ProxyBidirectional(c, secureConn, func(in, out int64) {
@@ -196,8 +213,21 @@ func (h *SNISpoofHandler) runOverseasListener(l net.Listener, psk []byte) {
 		}
 		go func(c net.Conn) {
 			defer c.Close()
-			// Deadline already covers ClientHello read, ACK write, and
-			// the handshake — all performed on c before proxying begins.
+
+			if err := h.pool.Acquire(h.ctx); err != nil {
+				return
+			}
+			released := false
+			release := func() {
+				if !released {
+					released = true
+					h.pool.Release()
+				}
+			}
+			defer release()
+
+			// Deadline already covers ClientHello read, ACK write, and the
+			// handshake — all performed on c before proxying begins.
 			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
 			buf := make([]byte, helloLen)
 			if _, err := io.ReadFull(c, buf); err != nil {
@@ -222,6 +252,9 @@ func (h *SNISpoofHandler) runOverseasListener(l net.Listener, psk []byte) {
 				return
 			}
 			defer targetConn.Close()
+
+			release()
+
 			_ = c.SetDeadline(time.Time{})
 			ProxyBidirectional(secureConn, targetConn, func(in, out int64) {
 				if config.GlobalConfig != nil {
