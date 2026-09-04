@@ -182,21 +182,25 @@ export const toolService = {
     return res.data;
   },
 
-  testSNI: async (
-    target_ip: string,
-    port: number,
-    sni: string
-  ): Promise<TestResult> => {
-    const res = await api.post('/tester/sni', { target_ip, port, sni });
+  /** Real TCP handshake probe (vNext — replaces the fake IP-spoof probe). */
+  testTCP: async (target_ip: string, port: number): Promise<TestResult> => {
+    const res = await api.post('/tester/tcp', { target_ip, port });
     return res.data;
   },
 
-  testIP: async (
+  /** Real TLS handshake probe; reports the negotiated protocol version. */
+  testTLS: async (
     target_ip: string,
     port: number,
-    fake_ip: string
+    server_name: string
   ): Promise<TestResult> => {
-    const res = await api.post('/tester/ip', { target_ip, port, fake_ip });
+    const res = await api.post('/tester/tls', { target_ip, port, server_name });
+    return res.data;
+  },
+
+  /** Real QUIC handshake probe — verifies the UDP path for QUIC/HTTP3. */
+  testQUIC: async (target_ip: string, port: number): Promise<TestResult> => {
+    const res = await api.post('/tester/quic', { target_ip, port });
     return res.data;
   },
 };

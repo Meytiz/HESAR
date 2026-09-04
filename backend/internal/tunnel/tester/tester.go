@@ -1,10 +1,38 @@
+// Package tester contains the connectivity/protocol probes exposed through
+// the panel's "Tester" page.
+//
+// vNext rewrite — the old package shipped two misleading probes:
+//
+//   - RunSNISpoofTest claimed to verify SNI spoofing but only measured
+//     whether some bytes came back after a fake ClientHello (any response,
+//     or even a read TIMEOUT, was reported as PASSED — a textbook false
+//     positive). The SNI Spoof feature itself has been REMOVED from HESAR,
+//     so its tester is removed as well.
+//   - RunIPSpoofTest never spoofed anything (its own details string even
+//     admitted it); it was a bare TCP connect.
+//
+// The replacements below test what they claim to test, with honest result
+// semantics and an SSRF guard: probes refuse private/loopback/link-local
+// targets (including the 169.254.169.254 cloud metadata endpoint) so the
+// authenticated tester cannot be abused to scan the internal network.
 package tester
 
 import (
-	"encoding/binary"
+	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
+
+	"github.com/quic-go/quic-go"
+)
+
+const (
+	probeDialTimeout    = 5 * time.Second
+	probeReadTimeout    = 5 * time.Second
+	probeQUICTimeout    = 6 * time.Second
+	maxPrivateCheckBits = 4
 )
 
 type TestResult struct {
@@ -13,276 +41,173 @@ type TestResult struct {
 	Details string `json:"details"`
 }
 
-// ──────────────────────────────────────────────────
-// IP Spoof Tester (based on ParsaKSH/spoof-tunnel)
-// ──────────────────────────────────────────────────
-
-// craftSpoofedTCPPacket creates a TCP packet with spoofed source IP
-func craftSpoofedTCPPacket(srcIP, dstIP string, dstPort int) []byte {
-	src := net.ParseIP(srcIP).To4()
-	dst := net.ParseIP(dstIP).To4()
-	if src == nil || dst == nil {
-		return nil
+// isDisallowedTarget implements the SSRF guard shared by every probe.
+func isDisallowedTarget(ip net.IP) error {
+	if ip == nil {
+		return fmt.Errorf("invalid target IP")
 	}
-
-	packet := make([]byte, 40) // IP header (20) + TCP header (20)
-
-	// IP Header
-	packet[0] = 0x45                                  // Version 4, IHL 5
-	packet[1] = 0x00                                  // DSCP
-	binary.BigEndian.PutUint16(packet[2:4], 40)        // Total Length
-	binary.BigEndian.PutUint16(packet[4:6], 0x1234)    // ID
-	packet[6] = 0x40                                   // Don't Fragment
-	packet[7] = 0x00                                   // Fragment Offset
-	packet[8] = 64                                     // TTL
-	packet[9] = 6                                      // Protocol: TCP
-	copy(packet[12:16], src)                            // Source IP (spoofed)
-	copy(packet[16:20], dst)                            // Destination IP
-
-	// IP Checksum
-	binary.BigEndian.PutUint16(packet[10:12], 0)
-	var sum uint32
-	for i := 0; i < 20; i += 2 {
-		sum += uint32(binary.BigEndian.Uint16(packet[i : i+2]))
+	if ip.IsLoopback() {
+		return fmt.Errorf("target %s is a loopback address (blocked by SSRF guard)", ip)
 	}
-	for sum > 0xFFFF {
-		sum = (sum >> 16) + (sum & 0xFFFF)
+	if ip.IsPrivate() {
+		return fmt.Errorf("target %s is in a private range (blocked by SSRF guard)", ip)
 	}
-	binary.BigEndian.PutUint16(packet[10:12], ^uint16(sum))
-
-	// TCP Header
-	binary.BigEndian.PutUint16(packet[20:22], 12345)       // Source Port
-	binary.BigEndian.PutUint16(packet[22:24], uint16(dstPort)) // Dest Port
-	binary.BigEndian.PutUint32(packet[24:28], 0x12345678)   // Seq
-	binary.BigEndian.PutUint32(packet[28:32], 0)            // Ack
-	packet[32] = 0x50                                       // Data Offset: 5
-	packet[33] = 0x02                                       // Flags: SYN
-	binary.BigEndian.PutUint16(packet[34:36], 65535)        // Window
-	binary.BigEndian.PutUint16(packet[36:38], 0)            // Checksum
-	binary.BigEndian.PutUint16(packet[38:40], 0)            // Urgent
-
-	return packet
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return fmt.Errorf("target %s is link-local (blocked: includes cloud metadata endpoints)", ip)
+	}
+	if ip.IsUnspecified() || ip.IsMulticast() {
+		return fmt.Errorf("target %s is not a unicast routable address", ip)
+	}
+	// Defense in depth: the cloud metadata IP (169.254.169.254) is already
+	// covered by IsLinkLocalUnicast, but call it out explicitly.
+	if ip.Equal(net.IPv4(169, 254, 169, 254)) {
+		return fmt.Errorf("target %s is the cloud metadata endpoint (blocked)", ip)
+	}
+	return nil
 }
 
-func RunIPSpoofTest(targetIP string, port int, fakeIP string) TestResult {
+func validateProbeTarget(targetIP string, port int) (net.IP, error) {
 	if port < 1 || port > 65535 {
-		return TestResult{Success: false, Details: "invalid port"}
+		return nil, fmt.Errorf("invalid port: must be 1-65535")
 	}
-	if net.ParseIP(targetIP) == nil {
-		return TestResult{Success: false, Details: "invalid target IP"}
+	ip := net.ParseIP(targetIP)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid target IP")
 	}
-	if net.ParseIP(fakeIP) == nil {
-		return TestResult{Success: false, Details: "invalid fake IP"}
+	if err := isDisallowedTarget(ip); err != nil {
+		return nil, err
+	}
+	return ip, nil
+}
+
+// ──────────────────────────────────────────────────
+// TCP reachability probe
+// ──────────────────────────────────────────────────
+
+// RunTCPTest performs a real TCP three-way handshake against targetIP:port.
+// It tests connectivity ONLY — nothing more is claimed.
+func RunTCPTest(targetIP string, port int) TestResult {
+	if _, err := validateProbeTarget(targetIP, port); err != nil {
+		return TestResult{Success: false, Details: err.Error()}
 	}
 
-	addr := fmt.Sprintf("%s:%d", targetIP, port)
+	addr := net.JoinHostPort(targetIP, strconv.Itoa(port))
 	start := time.Now()
-
-	// Step 1: Normal TCP connect to verify reachability
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	conn, err := net.DialTimeout("tcp", addr, probeDialTimeout)
 	if err != nil {
 		return TestResult{
 			Success: false,
 			Latency: time.Since(start).Milliseconds(),
-			Details: fmt.Sprintf("TCP connection to %s failed: %v. Target must be reachable first.", addr, err),
+			Details: fmt.Sprintf("TCP handshake to %s failed: %v", addr, err),
 		}
 	}
-	defer conn.Close()
-
-	tcpConnectTime := time.Since(start).Milliseconds()
-
-	// Step 2: Send spoofed IP header over the established connection
-	spoofedPacket := craftSpoofedTCPPacket(fakeIP, targetIP, port)
-	if spoofedPacket == nil {
-		return TestResult{Success: false, Details: "failed to craft spoofed packet"}
-	}
-
-	if _, err := conn.Write(spoofedPacket); err != nil {
-		return TestResult{
-			Success: false,
-			Latency: time.Since(start).Milliseconds(),
-			Details: fmt.Sprintf("failed to send spoofed packet: %v", err),
-		}
-	}
-
-	// Step 3: Read response
-	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	resp := make([]byte, 512)
-	n, err := conn.Read(resp)
-
-	totalLatency := time.Since(start).Milliseconds()
-
-	if err != nil {
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return TestResult{
-				Success: true,
-				Latency: totalLatency,
-				Details: fmt.Sprintf(
-					"IP Spoofing test PASSED. Connection stable with fake source %s → %s:%d (TCP: %dms, No RST detected)",
-					fakeIP, targetIP, port, tcpConnectTime,
-				),
-			}
-		}
-		return TestResult{
-			Success: false,
-			Latency: totalLatency,
-			Details: fmt.Sprintf("Connection reset after spoofed packet: %v. DPI may have blocked the spoofed header.", err),
-		}
-	}
-
+	_ = conn.Close()
 	return TestResult{
 		Success: true,
-		Latency: totalLatency,
-		Details: fmt.Sprintf(
-			"IP Spoofing test PASSED. Received %d bytes. Fake source %s → %s:%d (TCP: %dms)",
-			n, fakeIP, targetIP, port, tcpConnectTime,
-		),
+		Latency: time.Since(start).Milliseconds(),
+		Details: fmt.Sprintf("TCP handshake to %s completed (reachability confirmed; no protocol verification).", addr),
 	}
 }
 
 // ──────────────────────────────────────────────────
-// SNI Spoof Tester (based on aleskxyz/SNI-Spoofing-Go)
+// TLS probe (real handshake, reports negotiated version)
 // ──────────────────────────────────────────────────
 
-func makeTLSClientHello(sni string) []byte {
-	sniBytes := []byte(sni)
-	sniLen := len(sniBytes)
-
-	// Extensions: SNI extension
-	sniExtDataLen := 2 + 1 + 2 + sniLen          // server_name_list_len + type + name_len + name
-	sniExtLen := 2 + sniExtDataLen                 // ext_type + ext_len + data
-	extLen := sniExtLen                             // total extensions
-
-	// Handshake body
-	bodyLen := 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + extLen // ver+random+sid+cs+comp+ext
-
-	// TLS record
-	recordLen := 1 + 3 + bodyLen // handshake_type + hs_len(3) + body
-
-	buf := make([]byte, 0, 5+recordLen)
-
-	// TLS Record Header
-	buf = append(buf, 0x16, 0x03, 0x01) // Handshake, TLS 1.0 record
-	buf = append(buf, byte(recordLen>>8), byte(recordLen))
-
-	// Handshake Header
-	buf = append(buf, 0x01) // ClientHello
-	buf = append(buf, byte(bodyLen>>16), byte(bodyLen>>8), byte(bodyLen))
-
-	// Client Version
-	buf = append(buf, 0x03, 0x03) // TLS 1.2
-
-	// Random (32 bytes)
-	for i := 0; i < 32; i++ {
-		buf = append(buf, byte(i+0x01))
+// RunTLSTest performs an actual TLS handshake against the target and reports
+// the negotiated protocol version. Certificate trust is intentionally not
+// validated (this is a reachability/protocol probe, not a PKI audit).
+func RunTLSTest(targetIP string, port int, serverName string) TestResult {
+	if _, err := validateProbeTarget(targetIP, port); err != nil {
+		return TestResult{Success: false, Details: err.Error()}
 	}
 
-	// Session ID
-	buf = append(buf, 0x00) // length 0
-
-	// Cipher Suites
-	buf = append(buf, 0x00, 0x02) // length 2
-	buf = append(buf, 0x13, 0x01) // TLS_AES_128_GCM_SHA256
-
-	// Compression
-	buf = append(buf, 0x01) // length 1
-	buf = append(buf, 0x00) // null
-
-	// Extensions length
-	buf = append(buf, byte(extLen>>8), byte(extLen))
-
-	// SNI Extension
-	buf = append(buf, 0x00, 0x00) // type: server_name
-	buf = append(buf, byte(sniExtDataLen>>8), byte(sniExtDataLen))
-	buf = append(buf, 0x00, byte(sniLen+3)) // server name list length
-	buf = append(buf, 0x00)                  // name type: host_name
-	buf = append(buf, byte(sniLen>>8), byte(sniLen))
-	buf = append(buf, sniBytes...)
-
-	return buf
-}
-
-func RunSNISpoofTest(targetIP string, port int, sni string) TestResult {
-	if port < 1 || port > 65535 {
-		return TestResult{Success: false, Details: "invalid port"}
-	}
-	if net.ParseIP(targetIP) == nil {
-		return TestResult{Success: false, Details: "invalid target IP"}
-	}
-	if sni == "" {
-		return TestResult{Success: false, Details: "SNI domain is required"}
-	}
-
-	addr := fmt.Sprintf("%s:%d", targetIP, port)
+	addr := net.JoinHostPort(targetIP, strconv.Itoa(port))
 	start := time.Now()
 
-	// Step 1: TCP connect
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	dialer := &net.Dialer{Timeout: probeDialTimeout}
+	conf := &tls.Config{
+		InsecureSkipVerify: true, // probe semantics — see doc comment
+		ServerName:         serverName,
+	}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, conf)
 	if err != nil {
 		return TestResult{
 			Success: false,
 			Latency: time.Since(start).Milliseconds(),
-			Details: fmt.Sprintf("TCP connection to %s failed: %v", addr, err),
+			Details: fmt.Sprintf("TLS handshake with %s failed: %v", addr, err),
 		}
 	}
 	defer conn.Close()
 
-	tcpTime := time.Since(start).Milliseconds()
+	state := conn.ConnectionState()
+	version := tlsVersionName(state.Version)
+	subject := ""
+	if len(state.PeerCertificates) > 0 {
+		subject = state.PeerCertificates[0].Subject.String()
+	}
+	detail := fmt.Sprintf("TLS handshake OK with %s — negotiated %s, ALPN %q", addr, version, state.NegotiatedProtocol)
+	if subject != "" {
+		detail += fmt.Sprintf(", subject %q", subject)
+	}
+	return TestResult{
+		Success: true,
+		Latency: time.Since(start).Milliseconds(),
+		Details: detail,
+	}
+}
 
-	// Step 2: Send TLS ClientHello with spoofed SNI
-	hello := makeTLSClientHello(sni)
-	if _, err := conn.Write(hello); err != nil {
-		return TestResult{
-			Success: false,
-			Latency: time.Since(start).Milliseconds(),
-			Details: fmt.Sprintf("failed to send ClientHello: %v", err),
-		}
+func tlsVersionName(v uint16) string {
+	switch v {
+	case tls.VersionTLS13:
+		return "TLS 1.3"
+	case tls.VersionTLS12:
+		return "TLS 1.2"
+	case tls.VersionTLS11:
+		return "TLS 1.1"
+	case tls.VersionTLS10:
+		return "TLS 1.0"
+	default:
+		return fmt.Sprintf("unknown(0x%04x)", v)
+	}
+}
+
+// ──────────────────────────────────────────────────
+// QUIC probe (real QUIC handshake attempt)
+// ──────────────────────────────────────────────────
+
+// RunQUICTest attempts a genuine QUIC handshake against the target. A
+// completed handshake proves UDP + QUIC reachability. Handshake REJECTIONS
+// are still useful signal (something QUIC-ish answered), while timeouts
+// indicate filtering.
+func RunQUICTest(targetIP string, port int) TestResult {
+	if _, err := validateProbeTarget(targetIP, port); err != nil {
+		return TestResult{Success: false, Details: err.Error()}
 	}
 
-	// Step 3: Read ServerHello response
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	resp := make([]byte, 1024)
-	n, err := conn.Read(resp)
+	addr := net.JoinHostPort(targetIP, strconv.Itoa(port))
+	start := time.Now()
 
-	totalLatency := time.Since(start).Milliseconds()
+	ctx, cancel := context.WithTimeout(context.Background(), probeQUICTimeout)
+	defer cancel()
 
-	if err != nil {
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			// Timeout = connection didn't get RST = DPI likely allowed it
-			return TestResult{
-				Success: true,
-				Latency: totalLatency,
-				Details: fmt.Sprintf(
-					"SNI Spoof PASSED. Connection stable with SNI '%s' → %s:%d (No RST from DPI). TCP: %dms",
-					sni, targetIP, port, tcpTime,
-				),
-			}
-		}
-		return TestResult{
-			Success: false,
-			Latency: totalLatency,
-			Details: fmt.Sprintf("Connection reset: %v. DPI likely blocked SNI '%s'.", err, sni),
-		}
-	}
-
-	// Check if we got a TLS ServerHello (0x16 = handshake, 0x03 0x03 = TLS 1.2)
-	if n >= 3 && resp[0] == 0x16 && resp[1] == 0x03 {
+	conn, err := quic.DialAddr(ctx, addr, &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"hq-29", "h3", "hesar-quic/1"},
+	}, &quic.Config{
+		HandshakeIdleTimeout: probeQUICTimeout,
+	})
+	if err == nil {
+		_ = conn.CloseWithError(0, "probe done")
 		return TestResult{
 			Success: true,
-			Latency: totalLatency,
-			Details: fmt.Sprintf(
-				"SNI Spoof PASSED! Received TLS ServerHello (%d bytes). SNI '%s' accepted by %s:%d. TCP: %dms",
-				n, sni, targetIP, port, tcpTime,
-			),
+			Latency: time.Since(start).Milliseconds(),
+			Details: fmt.Sprintf("QUIC handshake with %s completed — UDP path is open for QUIC/HTTP3.", addr),
 		}
 	}
 
 	return TestResult{
-		Success: true,
-		Latency: totalLatency,
-		Details: fmt.Sprintf(
-			"SNI Spoof PASSED. Received %d bytes from %s:%d with SNI '%s'. TCP: %dms",
-			n, targetIP, port, sni, tcpTime,
-		),
+		Success: false,
+		Latency: time.Since(start).Milliseconds(),
+		Details: fmt.Sprintf("QUIC handshake with %s failed: %v (timeout usually means UDP is filtered; a version/transport error means a QUIC endpoint answered).", addr, err),
 	}
 }

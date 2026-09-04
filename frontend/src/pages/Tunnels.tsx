@@ -61,16 +61,15 @@ export const Tunnels: React.FC = () => {
   const [name, setName] = useState('');
   const [mode, setMode] = useState<'iran' | 'overseas'>('iran');
   const [protocol, setProtocol] = useState<
-    'kcp' | 'tcp' | 'ip_spoof' | 'sni_spoof'
-  >('tcp');
+    'tcp' | 'kcp' | 'quic' | 'tls'
+  >('quic');
   const [localPorts, setLocalPorts] = useState('80');
   const [remoteIp, setRemoteIp] = useState('');
   const [remotePort, setRemotePort] = useState(443);
   const [encryptionKey, setEncryptionKey] = useState('');
   const [targetPort, setTargetPort] = useState(8080);
   const [kcpMode, setKcpMode] = useState<'normal' | 'fast' | 'fast2' | 'fast3'>('fast3');
-  const [spoofSni, setSpoofSni] = useState('www.aparat.com');
-  const [fakeIp, setFakeIp] = useState('185.10.20.30');
+  const [quicEnableUdp, setQuicEnableUdp] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
@@ -118,15 +117,14 @@ export const Tunnels: React.FC = () => {
     setEditingId(null);
     setName('');
     setMode('iran');
-    setProtocol('tcp');
+    setProtocol('quic');
     setLocalPorts('80,880');
     setRemoteIp('');
     setRemotePort(443);
     setEncryptionKey(''); // ✅ خالی — کاربر keygen بزند
     setTargetPort(8080);
     setKcpMode('fast3');
-    setSpoofSni('www.aparat.com');
-    setFakeIp('185.10.20.30');
+    setQuicEnableUdp(false);
     setSaveError(null);
     setModalOpen(true);
   };
@@ -142,8 +140,7 @@ export const Tunnels: React.FC = () => {
     setEncryptionKey(t.encryption_key);
     setTargetPort(t.target_port || 8080);
     setKcpMode(t.kcp_mode || 'fast3');
-    setSpoofSni(t.spoof_sni || 'www.aparat.com');
-    setFakeIp(t.fake_ip || '185.10.20.30');
+    setQuicEnableUdp(Boolean(t.quic_enable_udp));
     setSaveError(null);
     setModalOpen(true);
   };
@@ -187,8 +184,7 @@ export const Tunnels: React.FC = () => {
       encryption_key: encryptionKey,
       target_port: Number(targetPort),
       kcp_mode: kcpMode,
-      spoof_sni: spoofSni,
-      fake_ip: fakeIp,
+      quic_enable_udp: quicEnableUdp,
     };
 
     try {
@@ -391,19 +387,11 @@ export const Tunnels: React.FC = () => {
                       </span>
                     </div>
                   )}
-                  {t.protocol === 'sni_spoof' && (
+                  {t.protocol === 'quic' && (
                     <div className="flex justify-between items-center py-0.5 border-t border-[#222222]/60 text-slate-400 truncate">
-                      <span>Spoofed Host SNI:</span>
-                      <span className="font-mono text-white truncate max-w-[140px]">
-                        {t.spoof_sni}
-                      </span>
-                    </div>
-                  )}
-                  {t.protocol === 'ip_spoof' && (
-                    <div className="flex justify-between items-center py-0.5 border-t border-[#222222]/60 text-slate-400">
-                      <span>Fake Target IP:</span>
-                      <span className="font-mono text-white">
-                        {t.fake_ip}
+                      <span>Multiplexing:</span>
+                      <span className="font-mono text-white truncate max-w-[160px]">
+                        QUIC streams{t.quic_enable_udp ? ' + DATAGRAM' : ''}
                       </span>
                     </div>
                   )}
@@ -553,13 +541,13 @@ export const Tunnels: React.FC = () => {
                       </label>
                       <select
                         value={protocol}
-                        onChange={(e) => setProtocol(e.target.value as 'kcp' | 'tcp' | 'ip_spoof' | 'sni_spoof')}
+                        onChange={(e) => setProtocol(e.target.value as 'tcp' | 'kcp' | 'quic' | 'tls')}
                         className="w-full bg-[#0a0a0a] border border-[#222222] rounded-xl px-3 sm:px-4 py-2 sm:py-2.5 text-sm text-white font-bold focus:outline-none focus:border-primary-500 uppercase"
                       >
-                        <option value="tcp">TCP (Raw Framed AEAD)</option>
-                        <option value="kcp">KCP (Reliable UDP)</option>
-                        <option value="sni_spoof">SNI Spoofing</option>
-                        <option value="ip_spoof">IP Spoofing</option>
+                        <option value="quic">QUIC / HTTP-3 (Recommended)</option>
+                        <option value="tls">TLS 1.3 over TCP (Fallback)</option>
+                        <option value="tcp">TCP (Legacy AEAD)</option>
+                        <option value="kcp">KCP (Legacy UDP)</option>
                       </select>
                     </div>
                   </div>
@@ -691,42 +679,24 @@ export const Tunnels: React.FC = () => {
                     </div>
                   )}
 
-                  {/* SNI Options */}
-                  {protocol === 'sni_spoof' && (
+                  {/* QUIC Options */}
+                  {protocol === 'quic' && (
                     <div className="bg-[#0a0a0a] border border-[#222222] p-3 sm:p-4 rounded-xl space-y-2">
-                      <label className="block text-xs font-semibold uppercase tracking-wider text-primary-400 flex items-center gap-1.5">
-                        <HelpCircle className="w-4 h-4" /> Spoofed SNI Domain
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={quicEnableUdp}
+                          onChange={(e) => setQuicEnableUdp(e.target.checked)}
+                          className="accent-primary-500"
+                        />
+                        <span className="text-xs font-semibold uppercase tracking-wider text-primary-400 flex items-center gap-1.5">
+                          <HelpCircle className="w-4 h-4" /> Experimental UDP relay (QUIC DATAGRAM)
+                        </span>
                       </label>
-                      <input
-                        type="text"
-                        required
-                        value={spoofSni}
-                        onChange={(e) => setSpoofSni(e.target.value)}
-                        placeholder="www.aparat.com"
-                        className="w-full bg-[#111111] border border-[#222222] rounded-xl px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-primary-500"
-                      />
                       <p className="text-[11px] text-slate-500">
-                        Domain used in TLS ClientHello SNI to bypass DPI filters.
-                      </p>
-                    </div>
-                  )}
-
-                  {/* IP Spoof Options */}
-                  {protocol === 'ip_spoof' && (
-                    <div className="bg-[#0a0a0a] border border-[#222222] p-3 sm:p-4 rounded-xl space-y-2">
-                      <label className="block text-xs font-semibold uppercase tracking-wider text-primary-400 flex items-center gap-1.5">
-                        <HelpCircle className="w-4 h-4" /> Fake Source IP
-                      </label>
-                      <input
-                        type="text"
-                        required
-                        value={fakeIp}
-                        onChange={(e) => setFakeIp(e.target.value)}
-                        placeholder="185.10.20.30"
-                        className="w-full bg-[#111111] border border-[#222222] rounded-xl px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-primary-500"
-                      />
-                      <p className="text-[11px] text-slate-500">
-                        Spoofed source IP for encapsulated packet headers.
+                        Relays local UDP traffic over QUIC DATAGRAM (RFC 9221).
+                        Also requires HESAR_ENABLE_QUIC_DATAGRAM=1 on the daemon.
+                        TLS 1.3 fallback is applied automatically when UDP is filtered.
                       </p>
                     </div>
                   )}

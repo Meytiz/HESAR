@@ -81,8 +81,11 @@ func StartServer(ctx context.Context, port int) error {
 
 	mux.Handle("/api/stats", AuthMiddleware(http.HandlerFunc(StatsGetHandler)))
 	mux.Handle("/api/optimize", AuthMiddleware(http.HandlerFunc(OptimizeExecHandler)))
-	mux.Handle("/api/tester/sni", AuthMiddleware(http.HandlerFunc(TesterSNIHandler)))
-	mux.Handle("/api/tester/ip", AuthMiddleware(http.HandlerFunc(TesterIPHandler)))
+	// vNext protocol probes (the legacy /api/tester/sni and /api/tester/ip
+	// endpoints were removed together with the SNI/IP spoof features).
+	mux.Handle("/api/tester/tcp", AuthMiddleware(http.HandlerFunc(TesterTCPHandler)))
+	mux.Handle("/api/tester/tls", AuthMiddleware(http.HandlerFunc(TesterTLSHandler)))
+	mux.Handle("/api/tester/quic", AuthMiddleware(http.HandlerFunc(TesterQUICHandler)))
 	mux.Handle("/api/keygen", AuthMiddleware(http.HandlerFunc(KeyGenHandler)))
 
 	// The log stream is authenticated via a short-lived, single-use

@@ -1,7 +1,9 @@
 package api
 
 import (
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -62,6 +64,29 @@ var tokenBlacklist = struct {
 	tokens map[string]time.Time
 }{tokens: make(map[string]time.Time)}
 
+// blacklistSweepOnce starts exactly one background sweeper that garbage
+// collects expired blacklist entries.
+var blacklistSweepOnce sync.Once
+
+func startBlacklistSweeper() {
+	blacklistSweepOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(10 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				now := time.Now()
+				tokenBlacklist.Lock()
+				for tok, expiry := range tokenBlacklist.tokens {
+					if now.After(expiry) {
+						delete(tokenBlacklist.tokens, tok)
+					}
+				}
+				tokenBlacklist.Unlock()
+			}
+		}()
+	})
+}
+
 func isTokenBlacklisted(tokenStr string) bool {
 	tokenBlacklist.RLock()
 	defer tokenBlacklist.RUnlock()
@@ -69,11 +94,12 @@ func isTokenBlacklisted(tokenStr string) bool {
 	if !exists {
 		return false
 	}
-	if time.Now().After(expiry) {
-		delete(tokenBlacklist.tokens, tokenStr)
-		return false
-	}
-	return true
+	// vNext race fix: the previous version called delete() here — a WRITE —
+	// while holding only the RLock, which is a data race against every
+	// concurrent reader/writer (instant -race detector hit, possible map
+	// corruption). Expiry cleanup now happens exclusively in the sweeper
+	// goroutine above; this function is strictly read-only.
+	return !time.Now().After(expiry)
 }
 
 func blacklistToken(tokenStr string, expiry time.Time) {
@@ -81,6 +107,14 @@ func blacklistToken(tokenStr string, expiry time.Time) {
 	defer tokenBlacklist.Unlock()
 	tokenBlacklist.tokens[tokenStr] = expiry
 }
+
+// JWT identity claims. iss/aud bind tokens to THIS panel instance so a
+// token issued by one HESAR node is rejected by another; jti makes every
+// token individually revocable through the blacklist.
+const (
+	jwtIssuer   = "hesar"
+	jwtAudience = "hesar-panel"
+)
 
 func AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -99,6 +133,7 @@ func AuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		tokenString := parts[1]
+		startBlacklistSweeper()
 		if isTokenBlacklisted(tokenString) {
 			jsonError(w, "token has been revoked", http.StatusUnauthorized)
 			return
@@ -109,7 +144,7 @@ func AuthMiddleware(next http.Handler) http.Handler {
 				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 			}
 			return []byte(secret), nil
-		})
+		}, jwt.WithIssuer(jwtIssuer), jwt.WithAudience(jwtAudience))
 		if err != nil || !token.Valid {
 			jsonError(w, "unauthorized token", http.StatusUnauthorized)
 			return
@@ -130,8 +165,7 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req LoginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		jsonError(w, "invalid request", http.StatusBadRequest)
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	cfg := config.GlobalConfig.GetConfig()
@@ -142,8 +176,13 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid username or password", http.StatusUnauthorized)
 		return
 	}
+	jtiBytes := make([]byte, 16)
+	_, _ = rand.Read(jtiBytes)
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"username": req.Username,
+		"iss":      jwtIssuer,
+		"aud":      jwtAudience,
+		"jti":      hex.EncodeToString(jtiBytes),
 		"exp":      time.Now().Add(24 * time.Hour).Unix(),
 		"iat":      time.Now().Unix(),
 	})

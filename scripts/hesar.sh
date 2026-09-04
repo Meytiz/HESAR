@@ -26,7 +26,7 @@ SYSTEMD_FILE="/etc/systemd/system/hesar.service"
 SYSCTL_FILE="/etc/sysctl.d/99-hesar-tune.conf"
 HESAR_USER="hesar"
 REPO_URL="https://github.com/Meytiz/HESAR"
-VERSION="1.1.0"
+VERSION="2.0.0"
 
 # ──────────────────────────────────────────────────
 # Cosign keyless signing parameters
@@ -238,7 +238,7 @@ draw_banner() {
     echo -e "  ${MAGENTA}╠═╣${NC} ${CYAN}║╣ ${NC} ${GREEN}╚═╗${NC} ${YELLOW}╠═╣${NC} ${RED}╠╦╝${NC}     ${BLUE}║ ${NC} ${PURPLE}║ ║${NC} ${CYAN}║║║${NC} ${GREEN}║║║${NC} ${YELLOW}║╣ ${NC} ${RED}║  ${NC}"
     echo -e "  ${MAGENTA}╩ ╩${NC} ${CYAN}╚═╝${NC} ${GREEN}╚═╝${NC} ${YELLOW}╩ ╩${NC} ${RED}╩╚═${NC}     ${BLUE}╩ ${NC} ${PURPLE}╚═╝${NC} ${CYAN}╝╚╝${NC} ${GREEN}╝╚╝${NC} ${YELLOW}╚═╝${NC} ${RED}╩═╝${NC}"
     echo ""
-    echo -e "  ${WHITE}${BOLD}TCP + KCP + IP/SNI SPOOFING${NC} ${WHITE}|${NC} ${YELLOW}BBR + Auto-Optimizer${NC}"
+    echo -e "  ${WHITE}${BOLD}QUIC + TLS 1.3 + TCP + KCP${NC} ${WHITE}|${NC} ${YELLOW}BBR + Auto-Optimizer${NC}"
     echo -e "  ${PURPLE}Version: ${VERSION}${NC}"
     echo ""
 }

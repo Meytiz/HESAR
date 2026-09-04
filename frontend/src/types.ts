@@ -2,7 +2,16 @@ export interface TunnelConfig {
   id: string;
   name: string;
   mode: 'iran' | 'overseas';
-  protocol: 'kcp' | 'tcp' | 'ip_spoof' | 'sni_spoof';
+  /**
+   * vNext transports:
+   *  - quic: primary. TCP→QUIC streams over one multiplexed connection
+   *          (+ optional experimental UDP relay via QUIC DATAGRAM).
+   *  - tls:  TLS 1.3-over-TCP fallback used when UDP/QUIC is filtered.
+   *  - tcp:  legacy custom AEAD transport (kept for compatibility).
+   *  - kcp:  legacy/experimental reliable-UDP transport.
+   * 'sni_spoof' and 'ip_spoof' were REMOVED in vNext.
+   */
+  protocol: 'tcp' | 'kcp' | 'quic' | 'tls';
   status: 'active' | 'inactive';
   local_ports: string;
   remote_ip: string;
@@ -10,8 +19,8 @@ export interface TunnelConfig {
   encryption_key: string;
   target_port: number;
   kcp_mode: 'normal' | 'fast' | 'fast2' | 'fast3';
-  spoof_sni: string;
-  fake_ip: string;
+  /** Experimental: relay UDP through QUIC DATAGRAM (quic tunnels only). */
+  quic_enable_udp?: boolean;
   bytes_in: number;
   bytes_out: number;
   /** Unix timestamp (seconds) when tunnel started, 0 if inactive */

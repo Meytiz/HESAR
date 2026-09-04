@@ -119,6 +119,22 @@ func maskKey(key string) string {
 	return key[:4] + "****" + key[len(key)-4:]
 }
 
+// maxJSONBodyBytes caps every request body accepted by the panel. The old
+// code passed r.Body straight to json.NewDecoder with no limit — a client
+// could stream an arbitrarily large body and pin memory/CPU on decode.
+const maxJSONBodyBytes = 1 << 20 // 1 MiB is far beyond any legitimate panel request
+
+// decodeJSONBody wraps http.MaxBytesReader around the request body before
+// decoding. Returns false (after writing an error response) on any failure.
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, v interface{}) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
 func ConfigGetHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -146,13 +162,21 @@ func ConfigUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		LogMaxSizeMB   int      `json:"log_max_size_mb"`
 		AllowedOrigins []string `json:"allowed_origins"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		jsonError(w, "invalid request body", http.StatusBadRequest)
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
 	if err := config.GlobalConfig.UpdateSettings(req.AdminUsername, req.AdminPassword, req.LogPath, req.LogMaxSizeMB); err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	// Credential change ⇒ kill every live session: rotate the JWT signing
+	// key so all previously issued tokens stop validating immediately.
+	if req.AdminPassword != "" {
+		if err := config.GlobalConfig.RotateSecretKey(); err != nil {
+			jsonError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		system.LogWarn("GUI password changed — JWT signing key rotated; all sessions invalidated")
 	}
 	if req.AllowedOrigins != nil {
 		for _, o := range req.AllowedOrigins {
@@ -194,8 +218,7 @@ func TunnelSaveHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var t config.TunnelConfig
-	if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
-		jsonError(w, "invalid request body", http.StatusBadRequest)
+	if !decodeJSONBody(w, r, &t) {
 		return
 	}
 	if t.ID == "" {
@@ -338,7 +361,16 @@ func OptimizeExecHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func TesterSNIHandler(w http.ResponseWriter, r *http.Request) {
+// ──────────────────────────────────────────────────
+// vNext tester endpoints.
+//
+// The legacy /api/tester/sni and /api/tester/ip endpoints are GONE together
+// with the SNI-Spoof / IP-Spoof features they advertised. The replacements
+// run real protocol probes (see internal/tunnel/tester) and share one SSRF
+// guard that refuses private/loopback/metadata targets.
+// ──────────────────────────────────────────────────
+
+func TesterTCPHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -346,18 +378,34 @@ func TesterSNIHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		TargetIP string `json:"target_ip"`
 		Port     int    `json:"port"`
-		SNI      string `json:"sni"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		jsonError(w, "invalid request body", http.StatusBadRequest)
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
-	res := tester.RunSNISpoofTest(req.TargetIP, req.Port, req.SNI)
+	res := tester.RunTCPTest(req.TargetIP, req.Port)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(res)
 }
 
-func TesterIPHandler(w http.ResponseWriter, r *http.Request) {
+func TesterTLSHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		TargetIP   string `json:"target_ip"`
+		Port       int    `json:"port"`
+		ServerName string `json:"server_name"`
+	}
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	res := tester.RunTLSTest(req.TargetIP, req.Port, req.ServerName)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
+}
+
+func TesterQUICHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -365,13 +413,11 @@ func TesterIPHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		TargetIP string `json:"target_ip"`
 		Port     int    `json:"port"`
-		FakeIP   string `json:"fake_ip"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		jsonError(w, "invalid request body", http.StatusBadRequest)
+	if !decodeJSONBody(w, r, &req) {
 		return
 	}
-	res := tester.RunIPSpoofTest(req.TargetIP, req.Port, req.FakeIP)
+	res := tester.RunQUICTest(req.TargetIP, req.Port)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(res)
 }

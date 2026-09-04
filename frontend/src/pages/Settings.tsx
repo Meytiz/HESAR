@@ -335,9 +335,9 @@ export const Settings: React.FC = () => {
               Security Recommendation:
             </span>
             <br />
-            To resist Iran DPI fingerprinting, ensure your transport encryption
-            keys are rotated frequently and consider coupling IP spoofing nodes
-            with upstream routing rules.
+            To resist DPI fingerprinting, ensure your transport encryption
+            keys are rotated frequently and prefer the QUIC transport (TLS 1.3
+            inside QUIC) over the legacy raw-framed protocols.
           </div>
         </div>
       </div>

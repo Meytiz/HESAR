@@ -10,13 +10,63 @@ permissions:
   id-token: write
 
 env:
-  GO_VERSION: '1.22'
+  # Must match the `go` directive in backend/go.mod (was stuck at 1.22
+  # while go.mod already required 1.25.0 — the build only worked because
+  # of implicit toolchain auto-download; making it explicit keeps CI and
+  # go.mod from silently drifting apart again).
+  GO_VERSION: '1.25'
   NODE_VERSION: '22'
 
 jobs:
+  verify:
+    name: Tests, Vet, Staticcheck, Vulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: backend/go.sum
+
+      - name: Go vet
+        working-directory: backend
+        run: go vet ./...
+
+      - name: Go tests (race detector)
+        working-directory: backend
+        run: go test -race -timeout 300s ./...
+
+      - name: staticcheck
+        uses: dominikh/staticcheck-action@v1
+        with:
+          version: latest
+          working-directory: backend
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          cd backend && govulncheck ./...
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Frontend install + typecheck
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run typecheck
+
   build:
     name: Build All
     runs-on: ubuntu-latest
+    needs: verify
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,6 +87,11 @@ jobs:
         run: npm run build
         env:
           VITE_APP_VERSION: ${{ github.ref_name }}
+
+      # The panel embeds the built SPA, so a broken frontend must fail the
+      # release pipeline BEFORE the Go binary is produced.
+      - name: Verify embedded frontend exists
+        run: test -f frontend/dist/index.html
 
       - name: Copy frontend to backend
         run: |

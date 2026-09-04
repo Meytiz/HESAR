@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
@@ -256,6 +257,15 @@ type SecureConn struct {
 	txNonce    uint64
 	rxNonce    uint64
 	readBuffer []byte
+	// writeMu serializes Write. Without it, two concurrent writers would
+	// interleave (a) the shared txNonce counter and (b) the per-chunk
+	// header/ciphertext write pair — both silently corrupting the stream.
+	// ProxyBidirectional happens to use one writer per direction today,
+	// but a net.Conn-style API must be safe regardless.
+	writeMu sync.Mutex
+	// closeOnce makes Close idempotent and race-free: net.Conn users
+	// commonly close from multiple goroutines (defer + error path).
+	closeOnce sync.Once
 }
 
 // NewSecureConn performs a mutual, PSK-authenticated ephemeral X25519
@@ -305,6 +315,9 @@ func NewSecureConn(underlying net.Conn, presharedKey []byte, isClient bool) (*Se
 }
 
 func (s *SecureConn) Write(b []byte) (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	totalWritten := 0
 	for len(b) > 0 {
 		chunkSize := len(b)
@@ -327,13 +340,14 @@ func (s *SecureConn) Write(b []byte) (int, error) {
 
 		cipherChunk := s.txAead.Seal(nil, nonce, plainChunk, nil)
 
-		header := make([]byte, 2)
-		binary.BigEndian.PutUint16(header, uint16(len(cipherChunk)))
+		// Frame = 2-byte big-endian length + ciphertext, emitted with a
+		// SINGLE Write call so concurrent writers (now serialized by
+		// writeMu anyway) can never tear a frame header from its body.
+		frame := make([]byte, 2+len(cipherChunk))
+		binary.BigEndian.PutUint16(frame[:2], uint16(len(cipherChunk)))
+		copy(frame[2:], cipherChunk)
 
-		if _, err := s.Conn.Write(header); err != nil {
-			return totalWritten, err
-		}
-		if _, err := s.Conn.Write(cipherChunk); err != nil {
+		if _, err := s.Conn.Write(frame); err != nil {
 			return totalWritten, err
 		}
 
@@ -386,9 +400,13 @@ func (s *SecureConn) Read(b []byte) (int, error) {
 }
 
 func (s *SecureConn) Close() error {
-	zero(s.readBuffer)
-	s.readBuffer = nil
-	return s.Conn.Close()
+	var err error
+	s.closeOnce.Do(func() {
+		zero(s.readBuffer)
+		s.readBuffer = nil
+		err = s.Conn.Close()
+	})
+	return err
 }
 
 // GenerateRandomHexKey reads `bytes` cryptographically secure random

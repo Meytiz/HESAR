@@ -17,6 +17,12 @@ var bufferPool = sync.Pool{
 	},
 }
 
+// MaxPortsPerTunnel bounds how many local ports a single tunnel may bind.
+// Without this cap a config like "1-65535" would attempt 65k listeners and
+// exhaust file descriptors instantly. 64 ports is far beyond any sane
+// reverse-tunnel setup while still allowing broad ranges like "8000-8063".
+const MaxPortsPerTunnel = 64
+
 func ParsePorts(portsStr string) ([]int, error) {
 	portsStr = strings.TrimSpace(portsStr)
 	if portsStr == "" {
@@ -60,6 +66,9 @@ func ParsePorts(portsStr string) ([]int, error) {
 			seen[p] = true
 			unique = append(unique, p)
 		}
+	}
+	if len(unique) > MaxPortsPerTunnel {
+		return nil, fmt.Errorf("too many ports (%d): a single tunnel may bind at most %d", len(unique), MaxPortsPerTunnel)
 	}
 	return unique, nil
 }

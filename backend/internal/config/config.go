@@ -19,18 +19,23 @@ import (
 type TunnelConfig struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
-	Mode          string `json:"mode"`          // "iran" or "overseas"
-	Protocol      string `json:"protocol"`      // "kcp", "tcp", "ip_spoof", "sni_spoof"
-	Status        string `json:"status"`        // "active" or "inactive"
-	LocalPorts    string `json:"local_ports"`   // e.g. "80", "80,880", "80-100"
+	Mode          string `json:"mode"`        // "iran" or "overseas"
+	Protocol      string `json:"protocol"`    // "quic", "tls", "tcp", "kcp"
+	Status        string `json:"status"`      // "active" or "inactive"
+	LocalPorts    string `json:"local_ports"` // e.g. "80", "80,880", "80-100"
 	RemoteIP      string `json:"remote_ip"`
 	RemotePort    int    `json:"remote_port"`
 	EncryptionKey string `json:"encryption_key"`
 	TargetPort    int    `json:"target_port"`
 
-	KCPMode  string `json:"kcp_mode"`
-	SpoofSNI string `json:"spoof_sni"`
-	FakeIP   string `json:"fake_ip"`
+	KCPMode string `json:"kcp_mode,omitempty"`
+
+	// QUICEnableUDP opts this tunnel into the experimental QUIC DATAGRAM
+	// UDP relay (also requires HESAR_ENABLE_QUIC_DATAGRAM=1 on the daemon).
+	// NOTE: the legacy "spoof_sni"/"fake_ip" fields of pre-vNext configs
+	// are silently ignored on load — SNI spoofing has been REMOVED and IP
+	// spoofing replaced by real IP-level tunneling on the QUIC path.
+	QUICEnableUDP bool `json:"quic_enable_udp,omitempty"`
 
 	BytesIn  int64 `json:"bytes_in"`
 	BytesOut int64 `json:"bytes_out"`
@@ -147,9 +152,11 @@ func validateTunnel(t *TunnelConfig) error {
 		return fmt.Errorf("invalid mode %q: must be 'iran' or 'overseas'", t.Mode)
 	}
 	switch t.Protocol {
-	case "kcp", "tcp", "ip_spoof", "sni_spoof":
+	case "tcp", "kcp", "quic", "tls":
+	case "sni_spoof", "ip_spoof":
+		return fmt.Errorf("protocol %q has been REMOVED in HESAR vNext; recreate this tunnel with 'quic' (recommended) or 'tls'", t.Protocol)
 	default:
-		return fmt.Errorf("invalid protocol %q", t.Protocol)
+		return fmt.Errorf("invalid protocol %q: must be one of tcp, kcp, quic, tls", t.Protocol)
 	}
 	if t.RemotePort < 1 || t.RemotePort > 65535 {
 		return fmt.Errorf("remote_port must be 1-65535, got %d", t.RemotePort)
@@ -174,12 +181,6 @@ func validateTunnel(t *TunnelConfig) error {
 		}
 	}
 
-	if t.Protocol == "sni_spoof" && t.SpoofSNI == "" {
-		return errors.New("spoof_sni is required for sni_spoof protocol")
-	}
-	if t.Protocol == "ip_spoof" && t.FakeIP == "" {
-		return errors.New("fake_ip is required for ip_spoof protocol")
-	}
 	if t.Protocol == "kcp" {
 		switch t.KCPMode {
 		case "", "normal", "fast", "fast2", "fast3":
@@ -479,6 +480,22 @@ func (m *Manager) UpdateTunnelStats(id string, bytesIn, bytesOut int64) error {
 		}
 	}
 	return errors.New("tunnel not found")
+}
+
+// RotateSecretKey replaces the JWT signing key. Every token signed with
+// the previous key instantly becomes invalid — this is the mechanism that
+// kills ALL live sessions when the admin password changes (previously,
+// sessions minted before a password change stayed valid for up to 24h).
+func (m *Manager) RotateSecretKey() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key, err := generateRandomHex(32)
+	if err != nil {
+		return fmt.Errorf("failed to rotate secret_key: %w", err)
+	}
+	m.config.SecretKey = key
+	return m.saveLocked()
 }
 
 func (m *Manager) DeleteTunnel(id string) error {

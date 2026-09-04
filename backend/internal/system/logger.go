@@ -121,24 +121,27 @@ func (l *Logger) UpdateConfig(filePath string, maxSizeMB int) error {
 	return nil
 }
 
-// Subscribe — ✅ بدون deadlock
+// Subscribe registers a new live-log subscriber and delivers a snapshot of
+// the recent backlog first.
+//
+// vNext fix: the old implementation delivered the snapshot from a detached
+// goroutine. If the subscriber disconnected quickly, Unsubscribe could
+// close(ch) while that goroutine was still sending → "send on closed
+// channel" panic (a crash bug). The channel is now sized to always hold
+// the full snapshot (maxRecent) plus live headroom, so the snapshot can be
+// delivered INLINE under the lock without ever blocking: no goroutine, no
+// post-close send, no race.
 func (l *Logger) Subscribe() chan LogMessage {
 	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	ch := make(chan LogMessage, l.maxRecent+50)
 	l.subscribers[ch] = true
 
-	// ✅ کپی snapshot
-	snapshot := make([]LogMessage, len(l.recentLogs))
-	copy(snapshot, l.recentLogs)
-	l.mu.Unlock() // ✅ قفل زودتر آزاد شود
-
-	// ✅ ارسال در گوروتین جدا — لاگ‌ها بلاک نمی‌شوند
-	go func() {
-		for _, msg := range snapshot {
-			ch <- msg
-		}
-	}()
+	for _, msg := range l.recentLogs {
+		// Guaranteed non-blocking: len(recentLogs) <= maxRecent < cap(ch).
+		ch <- msg
+	}
 
 	return ch
 }
