@@ -177,7 +177,11 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jtiBytes := make([]byte, 16)
-	_, _ = rand.Read(jtiBytes)
+	if _, err := rand.Read(jtiBytes); err != nil {
+		system.LogError("Failed to generate JWT ID (jti): %v", err)
+		jsonError(w, "failed to generate token", http.StatusInternalServerError)
+		return
+	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"username": req.Username,
 		"iss":      jwtIssuer,

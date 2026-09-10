@@ -163,10 +163,10 @@ func validateTunnel(t *TunnelConfig) error {
 	}
 
 	if t.EncryptionKey == "" {
-		return errors.New("encryption_key is required (leave it empty in the request to auto-generate a secure one)")
+		return errors.New("encryption_key is required (on create, an empty value auto-generates a secure key; on update, an empty value keeps the existing key)")
 	}
 	if len(t.EncryptionKey) < minEncryptionKeyLength {
-		return fmt.Errorf("encryption_key must be at least %d characters (got %d); submit an empty value to auto-generate a secure key instead of a short/guessable one", minEncryptionKeyLength, len(t.EncryptionKey))
+		return fmt.Errorf("encryption_key must be at least %d characters (got %d); on create, submit an empty value to auto-generate a secure key instead of a short/guessable one", minEncryptionKeyLength, len(t.EncryptionKey))
 	}
 
 	if t.Mode == "iran" {
@@ -426,26 +426,29 @@ func (m *Manager) AddTunnel(t *TunnelConfig) error {
 	return m.saveLocked()
 }
 
+// UpdateTunnel replaces a stored tunnel with t. An empty EncryptionKey
+// keeps the currently stored key — the panel only ever holds the masked
+// key, so "empty" is the explicit "key unchanged" signal. (On AddTunnel,
+// in contrast, an empty key auto-generates a secure one.)
 func (m *Manager) UpdateTunnel(t *TunnelConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if err := ensureEncryptionKey(t); err != nil {
-		return err
-	}
-
-	if err := validateTunnel(t); err != nil {
-		return err
-	}
-
 	for i, existing := range m.config.Tunnels {
-		if existing.ID == t.ID {
-			t.BytesIn = existing.BytesIn
-			t.BytesOut = existing.BytesOut
-			t.Uptime = existing.Uptime
-			m.config.Tunnels[i] = t
-			return m.saveLocked()
+		if existing.ID != t.ID {
+			continue
 		}
+		if t.EncryptionKey == "" {
+			t.EncryptionKey = existing.EncryptionKey
+		}
+		if err := validateTunnel(t); err != nil {
+			return err
+		}
+		t.BytesIn = existing.BytesIn
+		t.BytesOut = existing.BytesOut
+		t.Uptime = existing.Uptime
+		m.config.Tunnels[i] = t
+		return m.saveLocked()
 	}
 	return errors.New("tunnel not found")
 }

@@ -71,7 +71,7 @@ Shipped as a **single self-contained binary**, it provides:
 | Capability | Description |
 |---|---|
 | 🔐 Encrypted tunnels | With AEAD framing and length-prefixed chunks |
-| 🚀 QUIC-first transports | QUIC streams + TLS 1.3 with automatic TLS-over-TCP fallback |
+| 🚀 QUIC-first transports | QUIC streams + TLS 1.3-over-TCP as a manual fallback protocol |
 | 📊 Real-time dashboard | CPU/RAM, load, BBR, uptime |
 | ⚙️ Auto-install & network tuning | One command, systemd service, BBR |
 
@@ -84,7 +84,7 @@ Shipped as a **single self-contained binary**, it provides:
 | Protocol | Description |
 |---|---|
 | **QUIC** | Primary transport. TCP connections become QUIC streams multiplexed over one TLS 1.3 connection; optional experimental UDP relay via QUIC DATAGRAM (RFC 9221) |
-| **TLS** | TLS 1.3-over-TCP fallback, engaged automatically when UDP/QUIC is filtered (no security downgrade — same PSK-derived certificate pin) |
+| **TLS** | TLS 1.3-over-TCP fallback — switch the tunnel's protocol to `tls` manually when UDP/QUIC is filtered (no security downgrade — same PSK-derived certificate pin, and the same mutual authentication as QUIC) |
 | **TCP** | Legacy encrypted TCP transport with AEAD framing (kept for compatibility) |
 | **KCP** | Legacy low-latency, reliable UDP tunnel (experimental) |
 
@@ -156,7 +156,8 @@ The `scripts/hesar.sh` script provides the following commands:
               ▲                                   ▲
               │           Encrypted Tunnel        │
               └───────────────────────────────────┘
-              QUIC (TLS 1.3) → TCP fallback: TLS 1.3
+              QUIC (TLS 1.3) — when UDP is filtered, switch the tunnel
+              protocol to TLS 1.3-over-TCP (manual step, no auto-fallback)
               legacy: TCP/KCP + ChaCha20-Poly1305 AEAD
 ```
 

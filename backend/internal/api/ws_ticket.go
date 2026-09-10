@@ -3,10 +3,13 @@ package api
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"net"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/Meytiz/HESAR/backend/internal/system"
 )
 
 // ──────────────────────────────────────────────────
@@ -39,20 +42,22 @@ var wsTickets = &wsTicketStore{tickets: make(map[string]wsTicketEntry)}
 // (best-effort — behind a reverse proxy this is the proxy's IP, which is
 // still consistent between the ticket-issuing call and the immediately
 // following WebSocket upgrade from the same browser).
-func (s *wsTicketStore) issue(remoteIP string) string {
+func (s *wsTicketStore) issue(remoteIP string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cleanupLocked()
 
 	b := make([]byte, 32)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate ws ticket: %w", err)
+	}
 	ticket := hex.EncodeToString(b)
 
 	s.tickets[ticket] = wsTicketEntry{
 		expiresAt: time.Now().Add(wsTicketTTL),
 		remoteIP:  remoteIP,
 	}
-	return ticket
+	return ticket, nil
 }
 
 // consume validates and immediately invalidates a ticket (single-use).
@@ -105,7 +110,12 @@ func WSTicketHandler(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	ticket := wsTickets.issue(clientIP(r))
+	ticket, err := wsTickets.issue(clientIP(r))
+	if err != nil {
+		system.LogError("Failed to issue WebSocket ticket: %v", err)
+		jsonError(w, "failed to issue ticket", http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, map[string]interface{}{
 		"ticket":     ticket,
 		"expires_in": int(wsTicketTTL.Seconds()),

@@ -29,10 +29,9 @@ import (
 )
 
 const (
-	probeDialTimeout    = 5 * time.Second
-	probeReadTimeout    = 5 * time.Second
-	probeQUICTimeout    = 6 * time.Second
-	maxPrivateCheckBits = 4
+	probeDialTimeout = 5 * time.Second
+	probeReadTimeout = 5 * time.Second
+	probeQUICTimeout = 6 * time.Second
 )
 
 type TestResult struct {

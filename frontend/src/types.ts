@@ -9,9 +9,11 @@ export interface TunnelConfig {
    *  - tls:  TLS 1.3-over-TCP fallback used when UDP/QUIC is filtered.
    *  - tcp:  legacy custom AEAD transport (kept for compatibility).
    *  - kcp:  legacy/experimental reliable-UDP transport.
-   * 'sni_spoof' and 'ip_spoof' were REMOVED in vNext.
+   * 'sni_spoof' and 'ip_spoof' were REMOVED in vNext, but configs saved by
+   * older versions can still contain them — the panel surfaces such
+   * tunnels so they can be migrated (edit → choose quic/tls).
    */
-  protocol: 'tcp' | 'kcp' | 'quic' | 'tls';
+  protocol: 'tcp' | 'kcp' | 'quic' | 'tls' | 'sni_spoof' | 'ip_spoof';
   status: 'active' | 'inactive';
   local_ports: string;
   remote_ip: string;

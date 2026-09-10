@@ -84,12 +84,18 @@ func ComputeX25519SharedSecret(privateKey, peerPublicKey []byte) ([]byte, error)
 	if len(privateKey) != 32 || len(peerPublicKey) != 32 {
 		return nil, errors.New("invalid key length, must be 32 bytes")
 	}
-	var priv, peerPub, shared [32]byte
+	var priv, peerPub [32]byte
 	copy(priv[:], privateKey)
 	copy(peerPub[:], peerPublicKey)
 
-	curve25519.ScalarMult(&shared, &priv, &peerPub)
-	return shared[:], nil
+	// X25519 is the non-deprecated spelling of ScalarMult with the added
+	// benefit of rejecting low-order points instead of silently deriving
+	// an all-zero shared secret.
+	shared, err := curve25519.X25519(priv[:], peerPub[:])
+	if err != nil {
+		return nil, fmt.Errorf("invalid X25519 public key: %w", err)
+	}
+	return shared, nil
 }
 
 func DeriveHKDFKeys(ikm []byte, salt []byte, info []byte) ([]byte, []byte, error) {

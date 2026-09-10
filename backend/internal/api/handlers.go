@@ -89,10 +89,15 @@ func validateOriginEntry(raw string) error {
 	return nil
 }
 
-func generateSecureID() string {
+// generateSecureID returns a random tunnel ID prefix. A CSPRNG failure
+// here would produce a colliding/empty ID, so it is an error instead of
+// silently returning a weak value.
+func generateSecureID() (string, error) {
 	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return "tunnel_" + hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate tunnel ID: %w", err)
+	}
+	return "tunnel_" + hex.EncodeToString(b), nil
 }
 
 var validIDRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -117,6 +122,15 @@ func maskKey(key string) string {
 		return "****"
 	}
 	return key[:4] + "****" + key[len(key)-4:]
+}
+
+// isMaskedKey reports whether key is the list-endpoint mask produced by
+// maskKey. The panel never receives the real encryption key, only its
+// mask — so an edit that echoes the masked value back must mean "key
+// unchanged". Without this guard the masked string would silently
+// REPLACE the real shared secret and break the tunnel on both sides.
+func isMaskedKey(key string) bool {
+	return key == "****" || (len(key) == 12 && key[4:8] == "****")
 }
 
 // maxJSONBodyBytes caps every request body accepted by the panel. The old
@@ -222,12 +236,20 @@ func TunnelSaveHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if t.ID == "" {
-		t.ID = generateSecureID()
+		id, err := generateSecureID()
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		t.ID = id
 		if err := config.GlobalConfig.AddTunnel(&t); err != nil {
 			jsonError(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 	} else {
+		if isMaskedKey(t.EncryptionKey) {
+			t.EncryptionKey = "" // keep the stored key (masked value echoed back)
+		}
 		if err := config.GlobalConfig.UpdateTunnel(&t); err != nil {
 			jsonError(w, err.Error(), http.StatusNotFound)
 			return
