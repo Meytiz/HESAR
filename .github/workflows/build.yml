@@ -14,7 +14,7 @@ env:
   # while go.mod already required 1.25.0 — the build only worked because
   # of implicit toolchain auto-download; making it explicit keeps CI and
   # go.mod from silently drifting apart again).
-  GO_VERSION: '1.25'
+  GO_VERSION: '1.26.0'
   NODE_VERSION: '22'
 
 jobs:
@@ -24,6 +24,33 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Frontend install + typecheck
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run typecheck
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      # server.go embeds `dist/*` — on a fresh checkout the directory is
+      # empty and every Go tool (vet/test/staticcheck) fails with
+      # "pattern dist/*: no matching files found". Stage the built SPA
+      # before running any Go step.
+      - name: Stage embedded frontend for Go tooling
+        run: |
+          rm -rf backend/internal/api/dist
+          mkdir -p backend/internal/api/dist
+          cp -r frontend/dist/* backend/internal/api/dist/
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -49,19 +76,6 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           cd backend && govulncheck ./...
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Frontend install + typecheck
-        working-directory: frontend
-        run: |
-          npm ci
-          npm run typecheck
 
   build:
     name: Build All
