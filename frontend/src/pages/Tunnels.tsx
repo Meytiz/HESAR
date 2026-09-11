@@ -63,6 +63,14 @@ export const Tunnels: React.FC = () => {
   const [protocol, setProtocol] = useState<
     'tcp' | 'kcp' | 'quic' | 'tls'
   >('quic');
+  // A tunnel persisted by a pre-vNext build can still carry one of the REMOVED
+  // protocols ('sni_spoof' / 'ip_spoof'). The editor only accepts the four
+  // vNext transports, so the stale value is tracked separately and surfaced to
+  // the operator (with a suggested replacement) instead of being assigned to
+  // `protocol` — that assignment is what made `tsc` fail the entire frontend
+  // build ("Type '"sni_spoof"' is not assignable to SetStateAction<...>"),
+  // which in turn broke `npm run build` and every CI job that depends on it.
+  const [legacyProtocol, setLegacyProtocol] = useState<string | null>(null);
   const [localPorts, setLocalPorts] = useState('80');
   const [remoteIp, setRemoteIp] = useState('');
   const [remotePort, setRemotePort] = useState(443);
@@ -125,6 +133,7 @@ export const Tunnels: React.FC = () => {
     setTargetPort(8080);
     setKcpMode('fast3');
     setQuicEnableUdp(false);
+    setLegacyProtocol(null);
     setSaveError(null);
     setModalOpen(true);
   };
@@ -133,7 +142,17 @@ export const Tunnels: React.FC = () => {
     setEditingId(t.id);
     setName(t.name);
     setMode(t.mode);
-    setProtocol(t.protocol);
+    if (t.protocol === 'sni_spoof' || t.protocol === 'ip_spoof') {
+      // Removed in vNext: pre-fill QUIC (the recommended replacement) and tell
+      // the operator what happened. Saving writes a protocol the backend
+      // accepts, which migrates the tunnel; the old value is never echoed back
+      // because validateTunnel rejects it with a hard error.
+      setLegacyProtocol(t.protocol);
+      setProtocol('quic');
+    } else {
+      setLegacyProtocol(null);
+      setProtocol(t.protocol);
+    }
     setLocalPorts(t.local_ports);
     setRemoteIp(t.remote_ip);
     setRemotePort(t.remote_port);
@@ -499,6 +518,23 @@ export const Tunnels: React.FC = () => {
             {saveError && (
               <div className="mb-4 bg-red-500/10 border border-red-500/20 text-red-400 p-3 rounded-xl text-sm">
                 {saveError}
+              </div>
+            )}
+
+            {legacyProtocol && (
+              <div className="mb-4 bg-amber-500/10 border border-amber-500/25 text-amber-300 p-3 rounded-xl text-sm">
+                <p className="font-semibold uppercase tracking-wide text-xs mb-1">
+                  Deprecated protocol: {legacyProtocol.replace('_', ' ')}
+                </p>
+                <p>
+                  This tunnel was saved by an older HESAR build. The{' '}
+                  <code className="font-mono">{legacyProtocol}</code> transport was
+                  removed in vNext, so the form was switched to{' '}
+                  <span className="font-semibold">QUIC</span> — review the fields
+                  (and re-use the same encryption key on both ends), then save to
+                  migrate it. Pick “TLS 1.3 over TCP” instead if UDP/QUIC is
+                  filtered on this network.
+                </p>
               </div>
             )}
 

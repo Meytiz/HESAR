@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -149,6 +150,38 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, v interface{}) bool 
 	return true
 }
 
+// writeConfigError maps the two classes of failure coming out of the config
+// layer onto the right status codes: "no such tunnel" is a 404, a rejected
+// payload is a 400. Previously TunnelSaveHandler reported EVERY update error
+// as 404, so an invalid protocol or a too-short encryption key was surfaced to
+// the operator as "tunnel not found".
+func writeConfigError(w http.ResponseWriter, err error) {
+	if errors.Is(err, config.ErrTunnelNotFound) {
+		jsonError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	jsonError(w, err.Error(), http.StatusBadRequest)
+}
+
+// validateClientSuppliedID enforces the same ID grammar the path-based
+// endpoints parse with (see extractIDFromPath/validIDRegex) on the payload
+// side. Every ID the server generates itself ("tunnel_"+16 hex chars) already
+// satisfies it; what this rejects is a client that invents its own ID — instead
+// of the confusing 404 "tunnel not found" that UpdateTunnel returns for an
+// unmatchable ID, the operator gets an explicit "invalid tunnel ID". It also
+// bounds the length, since IDs are echoed back in every list/stats response and
+// an ID that cannot be expressed in a URL path would make the tunnel
+// unmanageable (only hand-editing config.json could remove it).
+func validateClientSuppliedID(id string) error {
+	if len(id) > 64 {
+		return fmt.Errorf("tunnel ID too long: %d characters (max 64)", len(id))
+	}
+	if !validIDRegex.MatchString(id) {
+		return fmt.Errorf("invalid tunnel ID %q: only letters, digits, '-' and '_' are allowed", id)
+	}
+	return nil
+}
+
 func ConfigGetHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -205,8 +238,15 @@ func ConfigUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		system.LogInfo("GUI Allowed WebSocket origins updated (%d entries)", len(req.AllowedOrigins))
 	}
-	if system.GlobalLogger != nil && req.LogPath != "" {
-		_ = system.GlobalLogger.UpdateConfig(req.LogPath, req.LogMaxSizeMB)
+	// Apply the new logging settings to the live logger. UpdateConfig treats
+	// an empty path / non-positive size as "unchanged", so partial submits are
+	// safe; a failure here must be VISIBLE (the operator is reading the very
+	// log stream that just refused to move) but is never fatal: the config is
+	// already saved and the old log target keeps working.
+	if system.GlobalLogger != nil {
+		if err := system.GlobalLogger.UpdateConfig(req.LogPath, req.LogMaxSizeMB); err != nil {
+			system.LogWarn("Settings saved, but logging could not be switched to %q: %v (keeping the previous log target)", req.LogPath, err)
+		}
 	}
 	system.LogInfo("GUI Settings updated successfully")
 	w.Header().Set("Content-Type", "application/json")
@@ -243,15 +283,19 @@ func TunnelSaveHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		t.ID = id
 		if err := config.GlobalConfig.AddTunnel(&t); err != nil {
-			jsonError(w, err.Error(), http.StatusBadRequest)
+			writeConfigError(w, err)
 			return
 		}
 	} else {
+		if err := validateClientSuppliedID(t.ID); err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if isMaskedKey(t.EncryptionKey) {
 			t.EncryptionKey = "" // keep the stored key (masked value echoed back)
 		}
 		if err := config.GlobalConfig.UpdateTunnel(&t); err != nil {
-			jsonError(w, err.Error(), http.StatusNotFound)
+			writeConfigError(w, err)
 			return
 		}
 	}
@@ -272,7 +316,12 @@ func TunnelDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = tunnel.GlobalTunnelManager.StopTunnel(id)
 	if err := config.GlobalConfig.DeleteTunnel(id); err != nil {
-		jsonError(w, err.Error(), http.StatusNotFound)
+		if errors.Is(err, config.ErrTunnelNotFound) {
+			jsonError(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		system.LogError("Failed to persist tunnel deletion for [%s]: %v", id, err)
+		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	system.LogInfo("Tunnel ID [%s] deleted", id)

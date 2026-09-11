@@ -176,6 +176,12 @@ func (h *TLSFallbackHandler) runIranListener(l net.Listener) {
 			defer release()
 
 			remoteAddr := net.JoinHostPort(h.cfg.RemoteIP, strconv.Itoa(h.cfg.RemotePort))
+			// tls.DialWithDialer completes the handshake itself, bounded by the
+			// dialer timeout (crypto/tls's dial() derives ONE context from
+			// dialer.Timeout and passes it to both DialContext and
+			// HandshakeContext), so no separate handshake deadline is needed
+			// on this side — unlike the overseas side, which accepts raw
+			// connections and must drive the handshake explicitly.
 			dialer := &net.Dialer{Timeout: 10 * time.Second}
 			tlsConn, err := tls.DialWithDialer(dialer, "tcp", remoteAddr, clientConf)
 			if err != nil {
@@ -183,11 +189,6 @@ func (h *TLSFallbackHandler) runIranListener(l net.Listener) {
 				return
 			}
 			defer tlsConn.Close()
-
-			if err := tlsConn.HandshakeContext(h.ctx); err != nil {
-				system.LogError("TLS fallback Iran handshake: %v", err)
-				return
-			}
 
 			release()
 
@@ -220,15 +221,46 @@ func (h *TLSFallbackHandler) runOverseasListener(l net.Listener) {
 				return
 			}
 
-			// tls.Listener already performed the handshake inside Accept;
-			// enforce ALPN to refuse cross-protocol replays.
+			// vNext fix (transport was 100% broken before this): the
+			// handshake is NOT completed by crypto/tls's listener —
+			// tls.Listen/tls.NewListener only wrap the accepted raw conn
+			// with tls.Server, and the handshake happens lazily on the
+			// first Read/Write. The previous code inspected
+			// ConnectionState().NegotiatedProtocol immediately after Accept,
+			// i.e. before any I/O, where it is always the zero value "", so
+			// the ALPN check rejected *every* legitimate session and the
+			// `tls` protocol could never proxy a single byte.
+			//
+			// Drive the handshake explicitly here. Bounding it with
+			// tlsHandshakeTimeout is what that constant was declared for, and
+			// it also closes a resource-starvation hole: the goroutine holds
+			// a slot from the shared ConnPool, so an unbounded
+			// client-that-connects-but-never-handshakes could wedge all pool
+			// slots permanently.
 			tlsConn, ok := c.(*tls.Conn)
-			if ok {
-				if tlsConn.ConnectionState().NegotiatedProtocol != AlpnTLS {
-					system.LogWarn("TLS fallback Overseas: rejected ALPN %q", tlsConn.ConnectionState().NegotiatedProtocol)
-					h.pool.Release()
-					return
-				}
+			if !ok {
+				// tls.Listen always yields a *tls.Conn; anything else means
+				// the connection was not wrapped, so it cannot be
+				// authenticated — refuse it rather than proxying plaintext.
+				system.LogError("TLS fallback Overseas: accepted conn is %T, expected *tls.Conn — rejecting", c)
+				h.pool.Release()
+				return
+			}
+			hsCtx, hsCancel := context.WithTimeout(h.ctx, tlsHandshakeTimeout)
+			hsErr := tlsConn.HandshakeContext(hsCtx)
+			hsCancel()
+			if hsErr != nil {
+				system.LogWarn("TLS fallback Overseas handshake failed: %v", hsErr)
+				h.pool.Release()
+				return
+			}
+
+			// Handshake is complete, so the negotiated ALPN is now real:
+			// enforce it to refuse cross-protocol replays.
+			if algpn := tlsConn.ConnectionState().NegotiatedProtocol; algpn != AlpnTLS {
+				system.LogWarn("TLS fallback Overseas: rejected ALPN %q", algpn)
+				h.pool.Release()
+				return
 			}
 
 			targetAddr := fmt.Sprintf("127.0.0.1:%d", h.cfg.TargetPort)
@@ -240,7 +272,7 @@ func (h *TLSFallbackHandler) runOverseasListener(l net.Listener) {
 			}
 			defer targetConn.Close()
 
-			ProxyBidirectional(c, targetConn, func(in, out int64) {
+			ProxyBidirectional(tlsConn, targetConn, func(in, out int64) {
 				if config.GlobalConfig != nil {
 					_ = config.GlobalConfig.UpdateTunnelStats(h.cfg.ID, in, out)
 				}

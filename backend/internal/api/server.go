@@ -13,7 +13,7 @@ import (
 	"github.com/Meytiz/HESAR/backend/internal/system"
 )
 
-//go:embed dist/*
+//go:embed all:dist
 var staticFiles embed.FS
 
 func jsonError(w http.ResponseWriter, message string, code int) {
@@ -34,9 +34,24 @@ func StartServer(ctx context.Context, port int) error {
 
 	mux := http.NewServeMux()
 
+	// `//go:embed all:dist` resolves as soon as the directory exists (a
+	// tracked placeholder keeps a fresh checkout compiling), so forgetting to
+	// stage a built panel into backend/internal/api/dist is no longer a
+	// compile-time error. Say it out loud instead of serving a blank page:
+	// without index.html the SPA below can only 404.
+	if _, err := staticFiles.Open("dist/index.html"); err != nil {
+		system.LogError("Embedded panel assets are missing (dist/index.html): the web UI will not load.")
+		system.LogError("Build the frontend and stage it: cd frontend && npm ci && npm run build, then copy frontend/dist/* into backend/internal/api/dist/.")
+	}
+
 	mux.HandleFunc("/api/auth/status", StatusHandler)
 	mux.HandleFunc("/api/auth/login", LoginHandler)
 	mux.HandleFunc("/api/auth/logout", LogoutHandler)
+	// Session probe for the SPA's route guard: unlike the public
+	// /api/auth/status, this only answers 200 while the caller's JWT is
+	// still valid (and not revoked), so "has a token" and "is authenticated"
+	// finally mean the same thing on both sides.
+	mux.Handle("/api/auth/verify", AuthMiddleware(http.HandlerFunc(AuthVerifyHandler)))
 
 	// Issues short-lived WebSocket tickets. Requires a valid JWT
 	// (Authorization: Bearer ...) exactly like every other protected

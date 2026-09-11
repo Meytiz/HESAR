@@ -51,12 +51,32 @@ func (rl *rateLimiter) isAllowed(ip string) bool {
 			recent = append(recent, t)
 		}
 	}
-	rl.attempts[ip] = recent
+	// vNext fix: an IP whose bucket fully expired used to be left in the map
+	// with an empty slice, so the map grew by one entry per distinct source
+	// address forever (a slow, unbounded leak driven by anyone who can open a
+	// TCP connection to the panel).
+	if len(recent) == 0 {
+		delete(rl.attempts, ip)
+	} else {
+		rl.attempts[ip] = recent
+	}
 	if len(recent) >= rl.max {
 		return false
 	}
-	rl.attempts[ip] = append(rl.attempts[ip], now)
+	rl.attempts[ip] = append(recent, now)
 	return true
+}
+
+// reset clears an IP's failure bucket. It is called after a SUCCESSFUL login:
+// isAllowed records every attempt, so without this the legitimate operator was
+// punished by their own activity — the fifth login inside the window (day one
+// of an install: login, logout, login after a reboot, …) locked the panel out
+// with 429 for the remainder of 15 minutes, and there is no self-service
+// recovery path short of restarting the daemon.
+func (rl *rateLimiter) reset(ip string) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	delete(rl.attempts, ip)
 }
 
 var tokenBlacklist = struct {
@@ -176,6 +196,10 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid username or password", http.StatusUnauthorized)
 		return
 	}
+	// Authenticated ⇒ this IP's failed-attempt bucket must be cleared, or the
+	// limiter would eventually lock out the owner of the panel for merely
+	// logging in a few times (see rateLimiter.reset).
+	loginLimiter.reset(ip)
 	jtiBytes := make([]byte, 16)
 	if _, err := rand.Read(jtiBytes); err != nil {
 		system.LogError("Failed to generate JWT ID (jti): %v", err)
@@ -214,6 +238,28 @@ func LogoutHandler(w http.ResponseWriter, r *http.Request) {
 	system.LogInfo("GUI Logout executed")
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"message": "Logged out successfully"})
+}
+
+// AuthVerifyHandler answers one question for the SPA: is the bearer token in
+// this request still a valid, unrevoked session?
+//
+// It exists because the panel's route guard needs a *protected* endpoint to
+// validate its stored JWT, and /api/auth/status is deliberately public (the
+// login form calls it to decide whether the daemon is up at all). Pointing
+// the guard at the public endpoint — which is what ProtectedRoute did —
+// meant "we have some token string" was treated as "we are authenticated",
+// so an expired or revoked token still rendered the whole panel until the
+// first real API call failed.
+func AuthVerifyHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"valid":    true,
+		"username": config.GlobalConfig.GetSafeConfig().AdminUsername,
+	})
 }
 
 func StatusHandler(w http.ResponseWriter, r *http.Request) {

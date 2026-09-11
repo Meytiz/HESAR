@@ -9,6 +9,14 @@ node_modules/
 *.exe
 *.dll
 
+# backend/internal/api/dist is the copy of the built SPA that server.go
+# embeds (`//go:embed all:dist`). The directory and a tracked placeholder MUST
+# exist, otherwise every Go tool on a fresh checkout dies with
+# "pattern all:dist: no matching files found" — only the real build output
+# staged there (by CI or by the README instructions) is ignored.
+backend/internal/api/dist/*
+!backend/internal/api/dist/.gitkeep
+
 # OS files
 .DS_Store
 Thumbs.db

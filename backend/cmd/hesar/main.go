@@ -46,18 +46,30 @@ func main() {
 		os.Exit(0)
 	}
 
-	if err := system.InitLogger("/var/log/hesar.log", 10); err != nil {
-		fmt.Printf("[FATAL] Failed to initialize logger: %v\n", err)
-		os.Exit(1)
-	}
-	system.LogInfo("Starting HESAR Engine %s...", Version)
-
+	// vNext fix: the config is loaded FIRST and the logger is created from
+	// it afterwards. The previous order called InitLogger("/var/log/hesar.log", 10)
+	// before any config was read, which silently ignored the configured
+	// log_path / log_max_size_mb AND made every unprivileged run abort with
+	// "[FATAL] Failed to initialize logger" — including the
+	// `./hesar -config data/config.json` flow documented in the README,
+	// because /var/log is not writable by a normal user.
+	//
+	// A missing/corrupt config stays fatal (nothing can work without it);
+	// system.Log* already falls back to stdout while no logger exists yet.
 	if err := config.InitGlobalConfig(*configPath); err != nil {
-		system.LogError("Failed to initialize config: %v", err)
+		fmt.Printf("[FATAL] Failed to initialize config: %v\n", err)
 		os.Exit(1)
 	}
 
 	cfg := config.GlobalConfig.GetConfig()
+
+	// A logging problem must never take the daemon — and with it every live
+	// tunnel — down: InitLogger always installs a working logger (in-memory
+	// ring buffer + the panel's live WebSocket stream) and reports an unusable
+	// log file on stderr by itself, which systemd captures in the unit journal.
+	_ = system.InitLogger(cfg.LogPath, cfg.LogMaxSizeMB)
+
+	system.LogInfo("Starting HESAR Engine %s (built %s)...", Version, BuildDate)
 
 	if *usernameOverride != "" {
 		password := os.Getenv("HESAR_PASSWORD")

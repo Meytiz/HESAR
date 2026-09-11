@@ -95,16 +95,40 @@ func copyWithIdleTimeout(dst, src net.Conn, timeout time.Duration) (int64, error
 	}
 }
 
+// closeWriter is satisfied by *net.TCPConn, *tls.Conn, crypto.SecureConn and
+// quicStreamConn. Half-closing the write side (instead of dropping the whole
+// connection) is what lets the peer's Read observe EOF promptly.
+type closeWriter interface {
+	CloseWrite() error
+}
+
+// halfCloseWrite shuts down only the write direction of c when the concrete
+// connection supports it. A previous version type-asserted *net.TCPConn only,
+// so QUIC streams and TLS connections never half-closed: the peer's proxy
+// goroutine then blocked until copyWithIdleTimeout's 5-minute read deadline
+// expired, pinning two goroutines, two conns and (on the QUIC side) a stream
+// slot for 5 minutes after every ordinary request/response exchange.
+func halfCloseWrite(c net.Conn) {
+	if cw, ok := c.(closeWriter); ok {
+		_ = cw.CloseWrite()
+	}
+}
+
+// ProxyBidirectional pumps bytes in both directions until either side ends,
+// then half-closes the peer's write side so the other direction can observe
+// EOF and unwind promptly, and finally closes both connections.
 func ProxyBidirectional(c1, c2 net.Conn, onBytes func(in, out int64)) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// Each direction is written by exactly one goroutine, so the matching
+	// half-close is always issued by that same goroutine — never
+	// concurrently with a Write (which both *net.TCPConn and quic-go's
+	// SendStream forbid).
 	go func() {
 		defer wg.Done()
 		n, _ := copyWithIdleTimeout(c1, c2, 5*time.Minute)
-		if tc, ok := c1.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
+		halfCloseWrite(c1)
 		if onBytes != nil {
 			onBytes(n, 0)
 		}
@@ -113,9 +137,7 @@ func ProxyBidirectional(c1, c2 net.Conn, onBytes func(in, out int64)) {
 	go func() {
 		defer wg.Done()
 		n, _ := copyWithIdleTimeout(c2, c1, 5*time.Minute)
-		if tc, ok := c2.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
+		halfCloseWrite(c2)
 		if onBytes != nil {
 			onBytes(0, n)
 		}
