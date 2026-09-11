@@ -550,6 +550,7 @@ func (h *QUICHandler) runIranUDPRelay(pc net.PacketConn) {
 				}
 				dgCtx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
 				data, err := qconn.ReceiveDatagram(dgCtx)
+				cancel()
 				if err != nil {
 					if errors.Is(h.ctx.Err(), context.Canceled) {
 						return
