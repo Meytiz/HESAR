@@ -391,6 +391,9 @@ HESAR/
 | Service won't start | Inspect logs: `journalctl -u hesar -f` |
 | Tunnel won't connect | Ensure the cipher key matches on both endpoints |
 | Frontend build error | `rm -rf node_modules && npm install` and retry |
+| Web panel serves a blank page | The binary was built without staged panel assets. Run `npm run build` in `frontend/`, copy `frontend/dist/*` into `backend/internal/api/dist/`, rebuild. The daemon logs an explicit error for this case at startup. |
+| Tunnel shows "Offline" after editing it | Fixed in vNext: an edit no longer clears the stored `status`, so auto-start survives. If you are on an older build, start the tunnel once more after editing. |
+| Locked out of the panel with 429 | The login limiter used to count *successful* logins; it now clears an IP's bucket on success. Wait out the 15-minute window (or restart the daemon) on older builds. |
 
 ---
 

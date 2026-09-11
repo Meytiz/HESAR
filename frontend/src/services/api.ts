@@ -80,9 +80,31 @@ export const authService = {
     }
   },
 
+  /**
+   * Public daemon liveness/initialization probe (no credentials needed).
+   * It deliberately says NOTHING about whether a token is valid.
+   */
   checkStatus: async () => {
     const res = await api.get('/auth/status');
     return res.data;
+  },
+
+  /**
+   * Authenticated session probe: /api/auth/verify sits behind the JWT
+   * middleware, so it only resolves while the stored token is still valid
+   * and unrevoked. This is what the route guard must use.
+   */
+  verifySession: async (): Promise<'valid' | 'invalid' | 'unreachable'> => {
+    try {
+      const res = await api.get('/auth/verify');
+      return res.data?.valid === true ? 'valid' : 'invalid';
+    } catch (err: unknown) {
+      const status = (err as { response?: { status?: number } })?.response?.status;
+      // Only an auth rejection means "the session is gone". Anything else
+      // (network drop, daemon restarting, 5xx) must NOT throw away a still
+      // usable token — the caller can simply retry.
+      return status === 401 || status === 403 ? 'invalid' : 'unreachable';
+    }
   },
 
   isAuthenticated: (): boolean => {

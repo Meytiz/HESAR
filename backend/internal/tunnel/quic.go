@@ -187,9 +187,24 @@ type quicStreamConn struct {
 	raddr net.Addr
 }
 
-func (q *quicStreamConn) Read(b []byte) (int, error)         { return q.s.Read(b) }
-func (q *quicStreamConn) Write(b []byte) (int, error)        { return q.s.Write(b) }
-func (q *quicStreamConn) Close() error                       { return q.s.Close() }
+func (q *quicStreamConn) Read(b []byte) (int, error)  { return q.s.Read(b) }
+func (q *quicStreamConn) Write(b []byte) (int, error) { return q.s.Write(b) }
+
+// Close terminates both directions of the stream. quic.Stream.Close only
+// closes the *send* direction, so without the explicit CancelRead the receive
+// side lingers — holding a stream slot and flow-control credit on the single
+// shared QUIC connection — until that connection is torn down.
+func (q *quicStreamConn) Close() error {
+	q.s.CancelRead(0)
+	return q.s.Close()
+}
+
+// CloseWrite closes just the send direction (i.e. it emits the FIN that lets
+// the peer's Read return EOF). ProxyBidirectional calls it through the
+// closeWriter interface for prompt, correct half-close teardown; *net.TCPConn
+// and *tls.Conn expose the same capability.
+func (q *quicStreamConn) CloseWrite() error { return q.s.Close() }
+
 func (q *quicStreamConn) LocalAddr() net.Addr                { return q.laddr }
 func (q *quicStreamConn) RemoteAddr() net.Addr               { return q.raddr }
 func (q *quicStreamConn) SetDeadline(t time.Time) error      { return q.s.SetDeadline(t) }

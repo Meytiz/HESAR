@@ -16,6 +16,14 @@ import (
 // Data Structures
 // ──────────────────────────────────────────────────
 
+// ErrTunnelNotFound is returned by every lookup/mutation that addresses a
+// tunnel by ID. Exposing it as a sentinel lets the HTTP layer answer 404 for
+// "no such tunnel" while still answering 400 for a rejected payload — the
+// previous code mapped every UpdateTunnel error to 404, including invalid
+// protocol/status/ports, which told the operator the tunnel was missing when
+// in fact the submitted configuration was rejected.
+var ErrTunnelNotFound = errors.New("tunnel not found")
+
 type TunnelConfig struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
@@ -157,6 +165,16 @@ func validateTunnel(t *TunnelConfig) error {
 		return fmt.Errorf("protocol %q has been REMOVED in HESAR vNext; recreate this tunnel with 'quic' (recommended) or 'tls'", t.Protocol)
 	default:
 		return fmt.Errorf("invalid protocol %q: must be one of tcp, kcp, quic, tls", t.Protocol)
+	}
+	// Status is persisted and drives auto-start, so a bogus value must not be
+	// accepted (it would leave the tunnel permanently unreachable from the
+	// panel: neither "active" nor "inactive"). Empty is legal and means
+	// "unspecified" — AddTunnel defaults it to inactive, UpdateTunnel keeps
+	// the stored value.
+	switch t.Status {
+	case "", "active", "inactive":
+	default:
+		return fmt.Errorf("invalid status %q: must be 'active', 'inactive', or empty", t.Status)
 	}
 	if t.RemotePort < 1 || t.RemotePort > 65535 {
 		return fmt.Errorf("remote_port must be 1-65535, got %d", t.RemotePort)
@@ -374,7 +392,7 @@ func (m *Manager) GetTunnel(id string) (*TunnelConfig, error) {
 			return &tCopy, nil
 		}
 	}
-	return nil, errors.New("tunnel not found")
+	return nil, ErrTunnelNotFound
 }
 
 // ──────────────────────────────────────────────────
@@ -429,7 +447,8 @@ func (m *Manager) AddTunnel(t *TunnelConfig) error {
 // UpdateTunnel replaces a stored tunnel with t. An empty EncryptionKey
 // keeps the currently stored key — the panel only ever holds the masked
 // key, so "empty" is the explicit "key unchanged" signal. (On AddTunnel,
-// in contrast, an empty key auto-generates a secure one.)
+// in contrast, an empty key auto-generates a secure one.) The same
+// "empty means unchanged" rule applies to Status.
 func (m *Manager) UpdateTunnel(t *TunnelConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -441,6 +460,15 @@ func (m *Manager) UpdateTunnel(t *TunnelConfig) error {
 		if t.EncryptionKey == "" {
 			t.EncryptionKey = existing.EncryptionKey
 		}
+		// vNext fix: the panel's edit form posts only the editable fields, so
+		// Status arrives empty. Overwriting it with "" used to (a) make the UI
+		// show a running tunnel as Offline and (b) — the damaging part — make
+		// StartConfiguredActiveTunnels skip the tunnel on the next daemon
+		// start, silently disabling auto-start for a tunnel the operator had
+		// explicitly enabled. An omitted status must therefore mean "keep".
+		if t.Status == "" {
+			t.Status = existing.Status
+		}
 		if err := validateTunnel(t); err != nil {
 			return err
 		}
@@ -450,7 +478,7 @@ func (m *Manager) UpdateTunnel(t *TunnelConfig) error {
 		m.config.Tunnels[i] = t
 		return m.saveLocked()
 	}
-	return errors.New("tunnel not found")
+	return ErrTunnelNotFound
 }
 
 func (m *Manager) UpdateTunnelStatus(id string, status string) error {
@@ -468,7 +496,7 @@ func (m *Manager) UpdateTunnelStatus(id string, status string) error {
 			return m.saveLocked()
 		}
 	}
-	return errors.New("tunnel not found")
+	return ErrTunnelNotFound
 }
 
 func (m *Manager) UpdateTunnelStats(id string, bytesIn, bytesOut int64) error {
@@ -482,7 +510,7 @@ func (m *Manager) UpdateTunnelStats(id string, bytesIn, bytesOut int64) error {
 			return nil
 		}
 	}
-	return errors.New("tunnel not found")
+	return ErrTunnelNotFound
 }
 
 // RotateSecretKey replaces the JWT signing key. Every token signed with
@@ -511,5 +539,5 @@ func (m *Manager) DeleteTunnel(id string) error {
 			return m.saveLocked()
 		}
 	}
-	return errors.New("tunnel not found")
+	return ErrTunnelNotFound
 }

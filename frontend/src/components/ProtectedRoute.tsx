@@ -18,17 +18,24 @@ export const ProtectedRoute: React.FC<{ children: React.ReactNode }> = ({
 
     let mounted = true;
 
-    // ✅ بررسی واقعی از سرور
+    // ✅ بررسی واقعی از سرور: /auth/verify is JWT-protected, so this answers
+    // 200 only while the stored token is still valid and unrevoked.
+    // (It used to call the PUBLIC /auth/status, which always answers 200 —
+    // so any leftover token string, expired or revoked alike, unlocked the
+    // whole panel UI until the first real API call failed behind it.)
     authService
-      .checkStatus()
-      .then(() => {
-        if (mounted) setValid(true);
+      .verifySession()
+      .then((state) => {
+        if (!mounted) return;
+        if (state === 'valid') {
+          setValid(true);
+          return;
+        }
+        if (state === 'invalid') sessionStorage.removeItem('hesar_token');
+        setValid(false);
       })
       .catch(() => {
-        if (mounted) {
-          sessionStorage.removeItem('hesar_token');
-          setValid(false);
-        }
+        if (mounted) setValid(false);
       })
       .finally(() => {
         if (mounted) setChecking(false);

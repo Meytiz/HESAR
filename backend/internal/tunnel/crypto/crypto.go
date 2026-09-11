@@ -376,8 +376,20 @@ func (s *SecureConn) Read(b []byte) (int, error) {
 
 	frameLen := binary.BigEndian.Uint16(header)
 
-	if int(frameLen) > MaxChunk+TagSize+NonceSize {
-		return 0, fmt.Errorf("frame too large: %d bytes", frameLen)
+	// A frame carries exactly one ciphertext: plaintext (at most MaxChunk)
+	// plus the Poly1305 tag — the nonce is NOT transmitted. The previous
+	// bound (MaxChunk+TagSize+NonceSize = 65528) was therefore wrong and,
+	// because frameLen is a uint16 (max 65535), practically unreachable:
+	// oversized frames were allocated and handed to Open() instead of being
+	// refused up front. Reject short frames too — nothing smaller than an
+	// empty plaintext plus its tag can ever be valid, and a peer that sends
+	// one is desynchronised, so failing fast is more honest than a
+	// guaranteed authentication error.
+	if frameLen > MaxChunk+TagSize {
+		return 0, fmt.Errorf("frame too large: %d bytes (max %d)", frameLen, MaxChunk+TagSize)
+	}
+	if frameLen < TagSize {
+		return 0, fmt.Errorf("frame too short: %d bytes (min %d)", frameLen, TagSize)
 	}
 
 	cipherChunk := make([]byte, frameLen)
@@ -413,6 +425,23 @@ func (s *SecureConn) Close() error {
 		err = s.Conn.Close()
 	})
 	return err
+}
+
+// CloseWrite half-closes the write direction by forwarding to the underlying
+// connection when it supports that operation (e.g. *net.TCPConn). It exists
+// so ProxyBidirectional can signal EOF to the peer instead of leaving its
+// reader blocked until the idle timeout: the AEAD framing is a stream of
+// independent length-prefixed frames, so stopping after a frame boundary is
+// always well-formed, and the read side stays fully usable.
+//
+// Returns nil (a no-op) for underlying connections without half-close support
+// (e.g. net.Pipe in tests, KCP sessions), which is exactly the previous
+// behaviour for those transports.
+func (s *SecureConn) CloseWrite() error {
+	if cw, ok := s.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
 
 // GenerateRandomHexKey reads `bytes` cryptographically secure random

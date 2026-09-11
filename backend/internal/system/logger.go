@@ -1,6 +1,7 @@
 package system
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,25 +30,64 @@ type Logger struct {
 
 var GlobalLogger *Logger
 
+// defaultLogFilePath is used only when the daemon was started without any
+// usable configured log path. It is intentionally a relative path: writing
+// into the process' working directory is the least surprising fallback for a
+// bare `./hesar` run, while packaged deployments always set an absolute
+// log_path (the installer uses /var/log/hesar.log).
+const defaultLogFilePath = "hesar.log"
+
+// maxKeptBackups bounds how many rotated log files survive cleanup.
+const maxKeptBackups = 5
+
+// InitLogger installs the process-wide logger and returns the result of
+// opening the log file.
+//
+// vNext fix: the daemon used to abort when /var/log/hesar.log could not be
+// created. That made the documented "run directly" flow (`./hesar -config
+// data/config.json` as an unprivileged user) fail permanently with
+// "[FATAL] Failed to initialize logger", and it also let a purely cosmetic
+// problem — where to persist a text file — take down every configured
+// tunnel. The logger is therefore ALWAYS installed: if the file cannot be
+// opened, l.file stays nil, log lines keep going into the in-memory ring
+// buffer (so the panel's live WebSocket stream still works) and a warning is
+// echoed to stderr, which systemd captures in the unit's journal.
 func InitLogger(filePath string, maxSizeMB int) error {
-	GlobalLogger = &Logger{
+	if filePath == "" {
+		filePath = defaultLogFilePath
+	}
+	l := &Logger{
 		filePath:    filePath,
 		maxSizeMB:   maxSizeMB,
 		subscribers: make(map[chan LogMessage]bool),
 		recentLogs:  make([]LogMessage, 0, 200),
 		maxRecent:   200,
 	}
-	return GlobalLogger.openFile()
+	err := l.openFile()
+	GlobalLogger = l
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[WARN] file logging disabled (%v); continuing with in-memory log buffer only\n", err)
+	}
+	return err
 }
 
 func (l *Logger) openFile() error {
 	if l.filePath == "" {
-		l.filePath = "hesar.log"
+		return errors.New("log file path is empty")
+	}
+	// Create the parent directory: operators routinely point log_path at a
+	// path that only exists once the first log line is written (e.g.
+	// /var/log/hesar/hesar.log), and a missing directory used to be the
+	// exact failure that killed startup.
+	if dir := filepath.Dir(l.filePath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return fmt.Errorf("create log directory %s: %w", dir, err)
+		}
 	}
 	// ✅ مجوز امن‌تر — فقط owner و group بخوانند
-	f, err := os.OpenFile(l.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0640)
+	f, err := os.OpenFile(l.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
 	if err != nil {
-		return err
+		return fmt.Errorf("open log file %s: %w", l.filePath, err)
 	}
 	l.file = f
 	return nil
@@ -60,8 +100,16 @@ func (l *Logger) rotateAndCleanup() {
 	}
 	_ = l.file.Close()
 
-	oldPath := l.filePath + fmt.Sprintf(".%d.bak", time.Now().Unix())
-	_ = os.Rename(l.filePath, oldPath)
+	// Nanosecond precision: two rotations can legitimately land in the same
+	// second under a burst of log lines, and a second-resolution suffix made
+	// the second rename overwrite the first backup silently.
+	oldPath := l.filePath + fmt.Sprintf(".%d.bak", time.Now().UnixNano())
+	if err := os.Rename(l.filePath, oldPath); err != nil {
+		// l.file still refers to the original inode, so appending continues
+		// into the unrotated file — but say so loudly: a silent failure here
+		// means the log grows past its configured cap forever.
+		fmt.Fprintf(os.Stderr, "[WARN] log rotation: rename %s -> %s failed: %v\n", l.filePath, oldPath, err)
+	}
 
 	// ✅ حداکثر ۵ فایل backup نگه دار
 	dir := filepath.Dir(l.filePath)
@@ -74,14 +122,22 @@ func (l *Logger) rotateAndCleanup() {
 			backups = append(backups, filepath.Join(dir, e.Name()))
 		}
 	}
-	if len(backups) > 5 {
+	if len(backups) > maxKeptBackups {
 		sort.Strings(backups)
-		for _, old := range backups[:len(backups)-5] {
+		for _, old := range backups[:len(backups)-maxKeptBackups] {
 			_ = os.Remove(old)
 		}
 	}
 
-	_ = l.openFile()
+	// If the fresh log file cannot be created, drop the (already closed)
+	// handle instead of keeping it: writing to a closed *os.File never
+	// succeeds, and pretending otherwise hides the fact that persistence is
+	// gone. The ring buffer and the live WebSocket stream keep working, and
+	// the next UpdateConfig/restart can point at a writable path again.
+	if err := l.openFile(); err != nil {
+		l.file = nil
+		fmt.Fprintf(os.Stderr, "[WARN] log rotation: cannot reopen %v\n", err)
+	}
 }
 
 func (l *Logger) checkRotation() {
@@ -97,21 +153,39 @@ func (l *Logger) checkRotation() {
 	}
 }
 
-// UpdateConfig — ✅ با بازگردانی در صورت خطا
+// UpdateConfig re-points the logger at a new file and/or rotation size, with
+// a full rollback if the new file cannot be opened.
+//
+// "Empty" now means "unchanged" for both arguments, mirroring how the rest of
+// the codebase treats optional fields. The previous behaviour was a
+// configuration-corruption bug: the panel's settings form (and any partial
+// API call) that omitted log_path sent "" here, which openFile() silently
+// rewrote to "hesar.log" — so the daemon started logging into whatever the
+// current working directory happened to be (under systemd: /etc/hesar, with
+// ProtectSystem=strict) — and a 0 maxSizeMB disabled rotation permanently,
+// letting the log file grow until the disk was full.
 func (l *Logger) UpdateConfig(filePath string, maxSizeMB int) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	oldFile := l.file
-	oldPath := l.filePath
+	if filePath == "" {
+		filePath = l.filePath
+	}
+	if maxSizeMB <= 0 {
+		maxSizeMB = l.maxSizeMB
+	}
+	if filePath == l.filePath && maxSizeMB == l.maxSizeMB {
+		return nil // nothing to do — never reopen the same file needlessly
+	}
+
+	oldFile, oldPath, oldMax := l.file, l.filePath, l.maxSizeMB
 
 	l.filePath = filePath
 	l.maxSizeMB = maxSizeMB
-
+	l.file = nil
 	if err := l.openFile(); err != nil {
-		// ✅ بازگردانی به حالت قبل
-		l.filePath = oldPath
-		l.file = oldFile
+		// ✅ بازگردانی کامل به حالت قبل (path, size AND file handle)
+		l.filePath, l.maxSizeMB, l.file = oldPath, oldMax, oldFile
 		return err
 	}
 
