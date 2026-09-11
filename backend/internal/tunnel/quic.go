@@ -545,7 +545,7 @@ func (h *QUICHandler) runIranUDPRelay(pc net.PacketConn) {
 				case <-h.ctx.Done():
 					return
 				case <-qconn.Context().Done():
-					break receiveLoop
+					return
 				default:
 				}
 				dgCtx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
