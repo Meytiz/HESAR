@@ -32,9 +32,10 @@ var GlobalTunnelManager = &CentralManager{
 	handlers: make(map[string]TunnelHandler),
 }
 
-// Protocol identifiers accepted by the vNext manager. "sni_spoof" and
-// "ip_spoof" are intentionally gone — see the SNI-removal and IP-tunneling
-// notes in the release documentation.
+// Protocol identifiers accepted by the vNext manager. "sni_spoof",
+// "ip_spoof" and the TLS-over-TCP fallback were intentionally REMOVED —
+// tunnels with those protocols get an explicit migration error instead
+// of silently misbehaving.
 const (
 	ProtocolTCP  = "tcp"
 	ProtocolKCP  = "kcp"
@@ -51,6 +52,8 @@ func newHandler(cfg *config.TunnelConfig) (TunnelHandler, error) {
 		return NewQUICHandler(cfg), nil
 	case "tls", "sni_spoof", "ip_spoof":
 		return nil, fmt.Errorf("protocol %q has been REMOVED in HESAR vNext (use 'quic', 'tcp' or 'kcp')", cfg.Protocol)
+	default:
+		return nil, fmt.Errorf("unsupported protocol: %s", cfg.Protocol)
 	}
 }
 
