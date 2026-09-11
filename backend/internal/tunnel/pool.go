@@ -46,9 +46,9 @@ import (
 // established tunnel sessions are never limited in number or throughput;
 // only the *rate of new connection setups* is capped.
 //
-// This file is a hard build dependency of tcp.go, kcp.go, quic.go and
-// tls_fallback.go — those four transports all hold a *ConnPool and call
-// Acquire/Release around their connection-establishment path.
+// This file is a hard build dependency of tcp.go, kcp.go and quic.go —
+// those three transports all hold a *ConnPool and call Acquire/Release
+// around their connection-establishment path.
 const DefaultMaxConcurrentHandshakes = 10
 
 // envMaxConcurrentHandshakes lets an operator override the pool size
@@ -100,7 +100,7 @@ func (p *ConnPool) Acquire(ctx context.Context) error {
 
 // Release frees a previously Acquire()-ed slot. Safe to call at most once
 // per successful Acquire call (handlers guard this with a small
-// "released" flag — see tcp.go/kcp.go/quic.go/tls_fallback.go).
+// "released" flag — see tcp.go/kcp.go/quic.go).
 func (p *ConnPool) Release() {
 	<-p.sem
 }

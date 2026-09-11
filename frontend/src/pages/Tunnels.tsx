@@ -581,7 +581,6 @@ export const Tunnels: React.FC = () => {
                         className="w-full bg-[#0a0a0a] border border-[#222222] rounded-xl px-3 sm:px-4 py-2 sm:py-2.5 text-sm text-white font-bold focus:outline-none focus:border-primary-500 uppercase"
                       >
                         <option value="quic">QUIC / HTTP-3 (Recommended)</option>
-                        <option value="tls">TLS 1.3 over TCP (Fallback)</option>
                         <option value="tcp">TCP (Legacy AEAD)</option>
                         <option value="kcp">KCP (Legacy UDP)</option>
                       </select>
@@ -732,7 +731,7 @@ export const Tunnels: React.FC = () => {
                       <p className="text-[11px] text-slate-500">
                         Relays local UDP traffic over QUIC DATAGRAM (RFC 9221).
                         Also requires HESAR_ENABLE_QUIC_DATAGRAM=1 on the daemon.
-                        TLS 1.3 fallback is applied automatically when UDP is filtered.
+                        If UDP is filtered, switch the tunnel protocol to TCP or KCP.
                       </p>
                     </div>
                   )}

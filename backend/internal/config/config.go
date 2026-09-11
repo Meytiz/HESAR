@@ -28,7 +28,7 @@ type TunnelConfig struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
 	Mode          string `json:"mode"`        // "iran" or "overseas"
-	Protocol      string `json:"protocol"`    // "quic", "tls", "tcp", "kcp"
+	Protocol      string `json:"protocol"`    // "quic", "tcp", "kcp"
 	Status        string `json:"status"`      // "active" or "inactive"
 	LocalPorts    string `json:"local_ports"` // e.g. "80", "80,880", "80-100"
 	RemoteIP      string `json:"remote_ip"`
@@ -41,8 +41,8 @@ type TunnelConfig struct {
 	// QUICEnableUDP opts this tunnel into the experimental QUIC DATAGRAM
 	// UDP relay (also requires HESAR_ENABLE_QUIC_DATAGRAM=1 on the daemon).
 	// NOTE: the legacy "spoof_sni"/"fake_ip" fields of pre-vNext configs
-	// are silently ignored on load — SNI spoofing has been REMOVED and IP
-	// spoofing replaced by real IP-level tunneling on the QUIC path.
+	// are silently ignored on load — SNI spoofing and the cosmetic IP
+	// "spoofing" have both been REMOVED entirely (see the release notes).
 	QUICEnableUDP bool `json:"quic_enable_udp,omitempty"`
 
 	BytesIn  int64 `json:"bytes_in"`
@@ -160,11 +160,11 @@ func validateTunnel(t *TunnelConfig) error {
 		return fmt.Errorf("invalid mode %q: must be 'iran' or 'overseas'", t.Mode)
 	}
 	switch t.Protocol {
-	case "tcp", "kcp", "quic", "tls":
-	case "sni_spoof", "ip_spoof":
-		return fmt.Errorf("protocol %q has been REMOVED in HESAR vNext; recreate this tunnel with 'quic' (recommended) or 'tls'", t.Protocol)
+	case "tcp", "kcp", "quic":
+	case "tls", "sni_spoof", "ip_spoof":
+		return fmt.Errorf("protocol %q has been REMOVED in HESAR vNext; recreate this tunnel with 'quic' (recommended), 'tcp' or 'kcp'", t.Protocol)
 	default:
-		return fmt.Errorf("invalid protocol %q: must be one of tcp, kcp, quic, tls", t.Protocol)
+		return fmt.Errorf("invalid protocol %q: must be one of tcp, kcp, quic", t.Protocol)
 	}
 	// Status is persisted and drives auto-start, so a bogus value must not be
 	// accepted (it would leave the tunnel permanently unreachable from the

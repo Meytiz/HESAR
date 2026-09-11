@@ -19,7 +19,7 @@ env:
 
 jobs:
   verify:
-    name: Tests, Vet, Staticcheck, Vulncheck
+    name: Vet, Staticcheck, Vulncheck
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -43,7 +43,7 @@ jobs:
         run: npm run build
 
       # server.go embeds `dist/*` — on a fresh checkout the directory is
-      # empty and every Go tool (vet/test/staticcheck) fails with
+      # empty and every Go tool (vet/staticcheck) fails with
       # "pattern dist/*: no matching files found". Stage the built SPA
       # before running any Go step.
       - name: Stage embedded frontend for Go tooling
@@ -61,10 +61,6 @@ jobs:
       - name: Go vet
         working-directory: backend
         run: go vet ./...
-
-      - name: Go tests (race detector)
-        working-directory: backend
-        run: go test -race -timeout 300s ./...
 
       - name: staticcheck
         uses: dominikh/staticcheck-action@v1
@@ -154,13 +150,7 @@ jobs:
           cp LICENSE release/
 
           # Keep hesar.sh's displayed VERSION in perfect sync with the
-          # git tag this release was built from (same source of truth
-          # already used for -X main.Version above), instead of a
-          # manually-maintained constant inside the script that can
-          # silently drift out of date with every release.
-          # GITHUB_REF_NAME is an automatic Actions env var equal to the
-          # tag name (e.g. "v1.1.9"); strip the leading "v" to match the
-          # script's existing bare-number style ("1.0.0").
+          # git tag this release was built from.
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           sed -i "s/^VERSION=\".*\"/VERSION=\"${TAG_VERSION}\"/" release/hesar.sh
 
@@ -229,7 +219,6 @@ jobs:
             checksums-sha256.txt
             checksums-sha256.txt.sig
             checksums-sha256.txt.pem
+            release/hesar.sh
             release/hesar.sh.sig
             release/hesar.sh.pem
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -39,7 +39,6 @@ const (
 	ProtocolTCP  = "tcp"
 	ProtocolKCP  = "kcp"
 	ProtocolQUIC = "quic"
-	ProtocolTLS  = "tls"
 )
 
 func newHandler(cfg *config.TunnelConfig) (TunnelHandler, error) {
@@ -50,12 +49,8 @@ func newHandler(cfg *config.TunnelConfig) (TunnelHandler, error) {
 		return NewKCPHandler(cfg), nil
 	case ProtocolQUIC:
 		return NewQUICHandler(cfg), nil
-	case ProtocolTLS:
-		return NewTLSFallbackHandler(cfg), nil
-	case "sni_spoof", "ip_spoof":
-		return nil, fmt.Errorf("protocol %q has been REMOVED in HESAR vNext (use 'quic' or 'tls')", cfg.Protocol)
-	default:
-		return nil, fmt.Errorf("unsupported protocol: %s", cfg.Protocol)
+	case "tls", "sni_spoof", "ip_spoof":
+		return nil, fmt.Errorf("protocol %q has been REMOVED in HESAR vNext (use 'quic', 'tcp' or 'kcp')", cfg.Protocol)
 	}
 }
 

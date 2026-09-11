@@ -71,7 +71,7 @@ Shipped as a **single self-contained binary**, it provides:
 | Capability | Description |
 |---|---|
 | 🔐 Encrypted tunnels | With AEAD framing and length-prefixed chunks |
-| 🚀 QUIC-first transports | QUIC streams + TLS 1.3-over-TCP as a manual fallback protocol |
+| 🚀 QUIC-first transports         | QUIC streams over one multiplexed TLS 1.3 connection; if UDP is filtered, switch the tunnel to TCP/KCP manually |
 | 📊 Real-time dashboard | CPU/RAM, load, BBR, uptime |
 | ⚙️ Auto-install & network tuning | One command, systemd service, BBR |
 
@@ -83,8 +83,7 @@ Shipped as a **single self-contained binary**, it provides:
 
 | Protocol | Description |
 |---|---|
-| **QUIC** | Primary transport. TCP connections become QUIC streams multiplexed over one TLS 1.3 connection; optional experimental UDP relay via QUIC DATAGRAM (RFC 9221) |
-| **TLS** | TLS 1.3-over-TCP fallback — switch the tunnel's protocol to `tls` manually when UDP/QUIC is filtered (no security downgrade — same PSK-derived certificate pin, and the same mutual authentication as QUIC) |
+| **QUIC** | Primary transport. TCP connections become QUIC streams multiplexed over one TLS 1.3 connection; optional experimental UDP relay via QUIC DATAGRAM (RFC 9221). If UDP/QUIC is filtered, switch the tunnel protocol to TCP or KCP manually (no fallback transport) |
 | **TCP** | Legacy encrypted TCP transport with AEAD framing (kept for compatibility) |
 | **KCP** | Legacy low-latency, reliable UDP tunnel (experimental) |
 
@@ -157,7 +156,7 @@ The `scripts/hesar.sh` script provides the following commands:
               │           Encrypted Tunnel        │
               └───────────────────────────────────┘
               QUIC (TLS 1.3) — when UDP is filtered, switch the tunnel
-              protocol to TLS 1.3-over-TCP (manual step, no auto-fallback)
+              protocol to TCP or KCP manually (no fallback transport)
               legacy: TCP/KCP + ChaCha20-Poly1305 AEAD
 ```
 
@@ -294,7 +293,7 @@ Main configuration file:
 
 | Key | Possible values |
 |---|---|
-| `protocol` | `quic` / `tls` / `tcp` / `kcp` |
+| `protocol` | `quic` / `tcp` / `kcp` |
 | `mode` | `iran` or `overseas` |
 | `local_ports` | Local ports (e.g. `"80,443"`, max 64 per tunnel) |
 | `remote_ip` | Destination node address |
@@ -394,14 +393,14 @@ HESAR/
 | Web panel serves a blank page | The binary was built without staged panel assets. Run `npm run build` in `frontend/`, copy `frontend/dist/*` into `backend/internal/api/dist/`, rebuild. The daemon logs an explicit error for this case at startup. |
 | Tunnel shows "Offline" after editing it | Fixed in vNext: an edit no longer clears the stored `status`, so auto-start survives. If you are on an older build, start the tunnel once more after editing. |
 | Locked out of the panel with 429 | The login limiter used to count *successful* logins; it now clears an IP's bucket on success. Wait out the 15-minute window (or restart the daemon) on older builds. |
+| Tunnel configured with "tls" won't start        | The TLS-over-TCP fallback transport was removed. Edit the tunnel in the panel and set protocol to quic, tcp or kcp, then start it again.                                                                |
 
 ---
 
 ## 🗺️ Roadmap
 
-- 🚧 WireGuard Transport
-- 🚧 QUIC Transport
-- 🚧 Multi Node Clustering
+* 🚧 WireGuard Transport
+* 🚧 Multi Node Clustering
 - 🚧 Monitoring and Alerts
 - 🚧 WebSocket Transport
 - 🚧 Prometheus Metrics Exporter

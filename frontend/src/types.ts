@@ -6,12 +6,12 @@ export interface TunnelConfig {
    * vNext transports:
    *  - quic: primary. TCP→QUIC streams over one multiplexed connection
    *          (+ optional experimental UDP relay via QUIC DATAGRAM).
-   *  - tls:  TLS 1.3-over-TCP fallback used when UDP/QUIC is filtered.
    *  - tcp:  legacy custom AEAD transport (kept for compatibility).
    *  - kcp:  legacy/experimental reliable-UDP transport.
-   * 'sni_spoof' and 'ip_spoof' were REMOVED in vNext, but configs saved by
-   * older versions can still contain them — the panel surfaces such
-   * tunnels so they can be migrated (edit → choose quic/tls).
+   * 'tls' (the removed TLS 1.3-over-TCP fallback) and 'sni_spoof'/'ip_spoof'
+   * were REMOVED, but configs saved by older versions can still contain
+   * them — the panel surfaces such tunnels so they can be migrated
+   * (edit → choose quic/tcp/kcp).
    */
   protocol: 'tcp' | 'kcp' | 'quic' | 'tls' | 'sni_spoof' | 'ip_spoof';
   status: 'active' | 'inactive';

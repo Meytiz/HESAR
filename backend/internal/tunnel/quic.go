@@ -20,12 +20,11 @@ package tunnel
 //   - Forward secrecy comes from the ephemeral TLS 1.3 key exchange; the
 //     static certificate is an authentication credential only.
 //   - ALPN "hesar-quic/1" provides protocol versioning.
-//
-// Fallback: when a QUIC dial fails (UDP blocked), callers of this handler's
-// dial path transparently retry over the TLS-over-TCP fallback transport
-// (see tls_fallback.go). Both transports use the identical pin scheme, so
-// falling back never weakens authentication or encryption — it is a pure
-// transport downgrade, never a security downgrade.
+// No fallback: when a QUIC dial fails (UDP filtered) the error is surfaced
+// to the operator, who switches the tunnel to the TCP or KCP transport
+// manually. The TLS 1.3-over-TCP fallback transport has been REMOVED —
+// every tunnel runs exactly one protocol, which keeps behaviour auditable
+// and removes a whole transport (and its ALPN) from the attack surface.
 
 import (
 	"context"
