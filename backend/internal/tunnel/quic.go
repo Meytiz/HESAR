@@ -524,11 +524,6 @@ type udpFlowEntry struct {
 }
 
 func (h *QUICHandler) runIranUDPRelay(pc net.PacketConn) {
-	type revEntry struct {
-		id       uint16
-		local    net.Addr
-		lastSeen time.Time
-	}
 	var mu sync.Mutex
 	byAddr := make(map[string]uint16)
 	byID := make(map[uint16]udpFlowEntry)
@@ -555,7 +550,6 @@ func (h *QUICHandler) runIranUDPRelay(pc net.PacketConn) {
 				}
 				dgCtx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
 				data, err := qconn.ReceiveDatagram(dgCtx)
-				cancel()
 				if err != nil {
 					if errors.Is(h.ctx.Err(), context.Canceled) {
 						return
