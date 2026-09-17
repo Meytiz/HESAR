@@ -172,6 +172,7 @@ The `scripts/hesar.sh` script provides the following commands:
 |---|---|
 | `--quickstart` | Auto-install with secure random configuration |
 | `--core` | Install service as a daemon only |
+| `--offline <artifact> [--core]` | Install a manually transferred release archive or binary without internet access; preserve existing configuration |
 | `--optimize` | Enable TCP BBR and kernel network tuning |
 | `--uninstall` | Completely remove HESAR and related files |
 | `--status` | Show systemd service status |
@@ -252,20 +253,102 @@ The installer will:
 
 ## 📦 Offline Installation
 
-### Method 1 — Pre-built binary
+### Method 1 — Manually transferred release archive + installer
 
-1. Download the appropriate build from [Releases](https://github.com/Meytiz/HESAR/releases).
-2. Transfer it to your server:
+The target server needs Linux with **systemd**, root/sudo, Bash 4+,
+GNU tar/gzip, coreutils, awk, and the usual user-management utilities.
+It does **not** need Go, Node.js, npm, curl, or internet access for this flow.
+The release binary must already contain the built web panel.
+
+1. On an internet-connected computer, obtain the matching **release asset**
+   and the updated `hesar.sh`. Do not use GitHub's **Source code (tar.gz)**:
+   that archive contains source files, not a runnable release binary.
+   Check the server architecture with `uname -m`:
+
+   | Server architecture | Release asset |
+   |---|---|
+   | `x86_64` | `hesar-linux-amd64.tar.gz` |
+   | `aarch64` / `arm64` | `hesar-linux-arm64.tar.gz` |
+
+2. Transfer both files manually (SFTP, SCP, or your server's file manager).
+   For example, place them in `/root/hesar-install/`:
+
+   ```text
+   /root/hesar-install/
+     hesar.sh
+     hesar-linux-amd64.tar.gz
+     checksums-sha256.txt       # optional; from the same release
+   ```
+
+3. Run the installer **without extracting the archive yourself**:
+
+   ```bash
+   sudo bash /root/hesar-install/hesar.sh --offline /root/hesar-install/hesar-linux-amd64.tar.gz
+   ```
+
+   For ARM64, substitute `hesar-linux-arm64.tar.gz`.
+   Quote paths containing spaces. Using `bash` means `chmod +x hesar.sh`
+   is not required. If a Windows editor changed the script to CRLF, convert
+   it to LF before running it.
+
+4. The installer installs `/usr/local/bin/hesar`, creates the service user
+   and configuration, and enables/restarts `hesar.service`. On a fresh install
+   it prints the random panel port, username and password. Save them.
+   The panel remains **HTTP**:
+
+   ```text
+   http://YOUR_SERVER_IP:<printed-port>/
+   ```
+
+   Replace `YOUR_SERVER_IP` with your server's address. Offline installation
+   deliberately skips external public-IP discovery. Allow access to the
+   printed TCP port in your firewall as appropriate for your network.
+
+5. Inspect service status and logs:
+
+   ```bash
+   sudo bash /root/hesar-install/hesar.sh --status
+   sudo bash /root/hesar-install/hesar.sh --logs
+   ```
+
+**Menu alternative:** run `sudo bash /root/hesar-install/hesar.sh`, select
+**9 — Offline Install**, and enter the archive's path. Quick Start also
+auto-detects a standard-named release archive in the working directory or
+beside the script, but explicit `--offline <path>` is recommended: an invalid
+or missing selected file fails instead of falling back to a download.
+
+**Reinstall / offline upgrade:** transfer the new archive and run the same
+`--offline` command. Existing `config.json`, credentials, panel port and
+tunnels are preserved. Back up your configuration before upgrading and
+observe the two-peer compatibility requirements in the security upgrade notes.
+`--update` and `--check` are online commands; do not use them for an offline
+upgrade. Optional `--core` uses the daemon-install flow; the web panel is still
+embedded in the same binary.
+
+**Validation:** the installer selects only the root-level
+`hesar-linux-<arch>` regular file, checks its ELF64 architecture and minimum
+size, stages it privately, and atomically replaces the binary after validation.
+It does not execute scripts contained in the archive. If
+`checksums-sha256.txt` is beside the selected artifact, its binary checksum
+must match; missing, duplicate or malformed matching entries cause failure.
+Without a manifest, installation proceeds with a warning. Local checksums
+provide integrity checking, **not signature/authenticity verification**:
+obtain and verify your files through a trusted channel before transferring.
+Validation failures leave the old binary in place; service-start failures
+do not currently trigger automatic offline rollback.
+
+A raw release binary is also accepted:
 
 ```bash
-scp hesar-linux-amd64 root@SERVER_IP:/tmp/hesar
+sudo bash /root/hesar-install/hesar.sh --offline /root/hesar-install/hesar-linux-amd64
 ```
 
-3. Run and install:
+Installer regression checks (temporary directories and mocked system services,
+not a real deployment):
 
 ```bash
-chmod +x /tmp/hesar
-sudo /tmp/hesar
+bash -n scripts/hesar.sh
+bash scripts/tests/offline_install_test.sh
 ```
 
 ### Method 2 — Build manually

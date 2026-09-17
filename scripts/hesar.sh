@@ -27,6 +27,9 @@ SYSCTL_FILE="/etc/sysctl.d/99-hesar-tune.conf"
 HESAR_USER="hesar"
 REPO_URL="https://github.com/Meytiz/HESAR"
 VERSION="2.0.0"
+# Directory containing this script (fallback: CWD). Used to locate offline
+# artifacts (tar.gz / raw binary) that were transferred alongside the script.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || pwd)"
 
 # ──────────────────────────────────────────────────
 # Cosign keyless signing parameters
@@ -39,6 +42,11 @@ COSIGN_IDENTITY_REGEXP="^https://github\.com/Meytiz/HESAR/\.github/workflows/bui
 # Helpers
 # ──────────────────────────────────────────────────
 get_public_ip() {
+    # A local install must never contact external IP-discovery services.
+    if [ "${LOCAL_INSTALL:-0}" = "1" ]; then
+        echo "YOUR_SERVER_IP"
+        return 0
+    fi
     local ip=""
     local services=(
         "https://api.ipify.org"
@@ -229,6 +237,126 @@ verify_self() {
 }
 
 # ──────────────────────────────────────────────────
+# Offline installation (manually transferred tar.gz / binary)
+#
+# Supported flows (no internet required on the server):
+#   sudo ./hesar.sh --offline hesar-linux-amd64.tar.gz
+#   sudo ./hesar.sh --quickstart   (auto-detects ./hesar-linux-<arch>[.tar.gz])
+# ──────────────────────────────────────────────────
+is_elf_binary() {
+    [ "$(head -c 4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]
+}
+
+# find_offline_archive prints the first matching tar.gz for BIN_ARCH
+# (CWD first, then the script's own directory) or fails.
+find_offline_archive() {
+    local candidate
+    for candidate in \
+        "./hesar-linux-${BIN_ARCH}.tar.gz" \
+        "${SCRIPT_DIR}/hesar-linux-${BIN_ARCH}.tar.gz"; do
+        if [ -f "${candidate}" ]; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+validate_local_binary() {
+    local binary="$1" layout machine expected_machine size
+    layout=$(od -An -tx1 -j 4 -N 2 -- "${binary}" | tr -d ' \n') || return 1
+    machine=$(od -An -tx1 -j 18 -N 2 -- "${binary}" | tr -d ' \n') || return 1
+    case "${BIN_ARCH}" in
+        amd64) expected_machine="3e00" ;;
+        arm64) expected_machine="b700" ;;
+        *) return 1 ;;
+    esac
+    size=$(wc -c < "${binary}") || return 1
+    if ! is_elf_binary "${binary}" || [ "${layout}" != "0201" ] ||
+        [ "${machine}" != "${expected_machine}" ] || [ "${size}" -lt 5000000 ]; then
+        echo -e "  ${RED}[ERROR] Expected a complete Linux ${BIN_ARCH} ELF64 HESAR release binary (at least 5 MB).${NC}"
+        return 1
+    fi
+}
+
+verify_local_checksum() {
+    local binary="$1" artifact="$2" manifest expected actual
+    # Use only the manifest beside the selected artifact, not an unrelated
+    # manifest in the caller's working directory.
+    manifest="$(dirname -- "${artifact}")/checksums-sha256.txt"
+    if [ ! -f "${manifest}" ]; then
+        echo -e "  ${YELLOW}[WARN] No adjacent checksums-sha256.txt; install only artifacts from a trusted source.${NC}"
+        return 0
+    fi
+    expected=$(awk -v name="hesar-linux-${BIN_ARCH}" '
+        { sub(/\r$/, ""); path=$2; sub(/^\*/, "", path); sub(/^.*\//, "", path) }
+        path == name { print $1 }
+    ' "${manifest}") || return 1
+    # Missing, duplicate or malformed entries must fail, not silently bypass.
+    if [[ ! "${expected}" =~ ^[[:xdigit:]]{64}$ ]]; then
+        echo -e "  ${RED}[ERROR] Manifest must contain exactly one valid checksum for hesar-linux-${BIN_ARCH}.${NC}"
+        return 1
+    fi
+    actual=$(sha256sum -- "${binary}") || return 1
+    actual="${actual%% *}"
+    if [ "${expected,,}" != "${actual}" ]; then
+        echo -e "  ${RED}[ERROR] CHECKSUM MISMATCH; current installation unchanged.${NC}"
+        return 1
+    fi
+    echo -e "  ${GREEN}---> Local SHA-256 verified (integrity only, not signature verification).${NC}"
+}
+
+# Subshell confines cleanup traps. Stage on the destination filesystem so
+# replacement is atomic; never remove the installed binary before validation.
+install_from_artifact() (
+    local artifact="$1" stage member listing count
+    if [ ! -f "${artifact}" ]; then
+        echo -e "  ${RED}[ERROR] Artifact not found: ${artifact}${NC}"
+        return 1
+    fi
+    mkdir -p -- "${INSTALL_DIR}" || return 1
+    stage=$(mktemp -d "${INSTALL_DIR}/.hesar-install.XXXXXXXX") || return 1
+    trap 'rm -rf -- "${stage}"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    case "${artifact}" in
+        *.tar.gz|*.tgz)
+            member="hesar-linux-${BIN_ARCH}"
+            listing=$(tar -tzf "${artifact}") || {
+                echo -e "  ${RED}[ERROR] Invalid tar.gz archive.${NC}"
+                return 1
+            }
+            count=$(printf '%s\n' "${listing}" | awk -v name="${member}" '$0 == name { n++ } END { print n+0 }')
+            if [ "${count}" != "1" ]; then
+                echo -e "  ${RED}[ERROR] Expected exactly one root-level ${member} in the release archive (not GitHub source code).${NC}"
+                return 1
+            fi
+            listing=$(LC_ALL=C tar -tvzf "${artifact}" -- "${member}") || return 1
+            if [[ "${listing:0:1}" != "-" ]] || [[ "${listing}" == *$'\n'* ]]; then
+                echo -e "  ${RED}[ERROR] Archive binary must be a single regular file, not a link or directory.${NC}"
+                return 1
+            fi
+            # Stream just this member to a file we own. No archive paths,
+            # permissions, links, or bundled scripts are installed/executed.
+            tar -xOzf "${artifact}" -- "${member}" > "${stage}/hesar" || return 1
+            ;;
+        *)
+            cp -- "${artifact}" "${stage}/hesar" || return 1
+            ;;
+    esac
+    validate_local_binary "${stage}/hesar" || return 1
+    verify_local_checksum "${stage}/hesar" "${artifact}" || return 1
+    chmod 0755 "${stage}/hesar" || return 1
+    mv -f -- "${stage}/hesar" "${INSTALL_DIR}/hesar" || return 1
+    echo -e "  ${GREEN}---> Local binary validated and installed.${NC}"
+)
+
+install_from_archive() {
+    install_from_artifact "$1"
+}
+
+# ──────────────────────────────────────────────────
 # Banner
 # ──────────────────────────────────────────────────
 draw_banner() {
@@ -263,18 +391,24 @@ install_binaries() {
         useradd -r -s /bin/false -d "${CONFIG_DIR}" "${HESAR_USER}" 2>/dev/null || true
     fi
 
-    systemctl stop hesar 2>/dev/null || true
-    sleep 1
-
-    if [ -f "./backend/hesar" ]; then
+    local archive_path
+    LOCAL_INSTALL=1
+    if [ -n "${OFFLINE_ARTIFACT:-}" ]; then
+        echo -e "  ${GREEN}---> Installing from specified offline artifact...${NC}"
+        install_from_artifact "${OFFLINE_ARTIFACT}" || return 1
+    elif [ -f "./backend/hesar" ]; then
         echo -e "  ${GREEN}---> Local binary found. Installing...${NC}"
-        rm -f "${INSTALL_DIR}/hesar"
-        cp ./backend/hesar "${INSTALL_DIR}/hesar"
-    elif [ -f "./hesar-linux-${BIN_ARCH}" ]; then
+        install_from_artifact "./backend/hesar" || return 1
+    elif [ -f "./hesar-linux-${BIN_ARCH}" ] || [ -f "${SCRIPT_DIR}/hesar-linux-${BIN_ARCH}" ]; then
+        local raw_bin="./hesar-linux-${BIN_ARCH}"
+        [ -f "${raw_bin}" ] || raw_bin="${SCRIPT_DIR}/hesar-linux-${BIN_ARCH}"
         echo -e "  ${GREEN}---> Offline binary found. Installing...${NC}"
-        rm -f "${INSTALL_DIR}/hesar"
-        cp "./hesar-linux-${BIN_ARCH}" "${INSTALL_DIR}/hesar"
+        install_from_artifact "${raw_bin}" || return 1
+    elif archive_path=$(find_offline_archive); then
+        echo -e "  ${GREEN}---> Offline archive found: ${archive_path}${NC}"
+        install_from_archive "${archive_path}" || return 1
     else
+        LOCAL_INSTALL=0
         echo -e "  ${YELLOW}---> Downloading latest release...${NC}"
         local url="${REPO_URL}/releases/latest/download/hesar-linux-${BIN_ARCH}"
         local checksum_url="${REPO_URL}/releases/latest/download/checksums-sha256.txt"
@@ -367,7 +501,13 @@ EOF
 quick_start_install() {
     check_root
     echo ""
-    install_binaries
+    install_binaries || return 1
+
+    if [ -f "${DATA_DIR}/config.json" ]; then
+        echo -e "  ${GREEN}---> Existing config preserved (credentials, panel port and tunnels unchanged).${NC}"
+        setup_systemd
+        return
+    fi
 
     echo -e "  ${YELLOW}---> Generating secure random credentials...${NC}"
     RAND_PORT=$(shuf -i 5000-9999 -n 1 2>/dev/null || echo "8443")
@@ -414,7 +554,7 @@ EOF
 core_only_install() {
     check_root
     echo ""
-    install_binaries
+    install_binaries || return 1
 
     echo -e "  ${YELLOW}---> Setting up Core daemon configuration...${NC}"
     if [ ! -f "${DATA_DIR}/config.json" ]; then
@@ -446,6 +586,26 @@ EOF
 
     setup_systemd
     echo -e "  ${GREEN}---> Core daemon installed and running!${NC}"
+}
+
+# ──────────────────────────────────────────────────
+# Option 9: Offline Install (local tar.gz / binary)
+# ──────────────────────────────────────────────────
+offline_install() {
+    check_root
+    echo ""
+    echo -e "  ${CYAN}---> Offline Installation from a locally transferred artifact${NC}"
+    echo ""
+    read -rp "  Path to hesar-linux-<arch>.tar.gz (or the raw binary): " artifact_path
+    if [ -z "${artifact_path}" ]; then
+        echo -e "  ${RED}[ERROR] No path provided.${NC}"
+        return 1
+    fi
+    local result=0
+    OFFLINE_ARTIFACT="${artifact_path}"
+    quick_start_install || result=$?
+    unset OFFLINE_ARTIFACT
+    return "${result}"
 }
 
 # ──────────────────────────────────────────────────
@@ -780,6 +940,7 @@ main_menu() {
         echo -e "  ${WHITE}${NC}   ${CYAN}6)${NC}  ${WHITE}Check Service Status${NC}                         ${WHITE}${NC}"
         echo -e "  ${WHITE}${NC}   ${CYAN}7)${NC}  ${WHITE}View Service Logs${NC}                            ${WHITE}${NC}"
         echo -e "  ${WHITE}${NC}   ${RED}8)${NC}  ${RED}Complete Uninstall HESAR${NC}                     ${WHITE}${NC}"
+        echo -e "  ${WHITE}${NC}   ${GREEN}9)${NC}  ${WHITE}Offline Install (local tar.gz / binary)${NC}      ${WHITE}${NC}"
         echo -e "  ${WHITE}${NC}   ${RED}0)${NC}  ${WHITE}Exit${NC}                                         ${WHITE}${NC}"
         echo -e "  ${WHITE}└─────────────────────────────────────────────────────┘${NC}"
         echo ""
@@ -794,6 +955,7 @@ main_menu() {
             6) do_status;           press_enter ;;
             7) do_logs;             press_enter ;;
             8) uninstall_hesar;     press_enter ;;
+            9) offline_install;     press_enter ;;
             0) echo -e "  ${GREEN}Goodbye!${NC}"; echo ""; exit 0 ;;
             *) echo -e "  ${RED}[ERROR] Invalid selection.${NC}"; sleep 1 ;;
         esac
@@ -803,6 +965,11 @@ main_menu() {
 # ──────────────────────────────────────────────────
 # CLI Arguments
 # ──────────────────────────────────────────────────
+# Sourcing defines functions only, for isolated installer regression tests.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
+
 case "${1:-}" in
     --quickstart)  quick_start_install ;;
     --core)        core_only_install ;;
@@ -812,10 +979,23 @@ case "${1:-}" in
     --uninstall)   uninstall_hesar ;;
     --status)      do_status ;;
     --logs)        do_logs ;;
+    --offline)
+        if [ -z "${2:-}" ] || [ "$#" -gt 3 ] ||
+            { [ "$#" -eq 3 ] && [ "${3}" != "--core" ]; }; then
+            echo "Usage: $0 --offline <hesar-linux-<arch>.tar.gz | hesar-linux-<arch>> [--core]"
+            exit 1
+        fi
+        OFFLINE_ARTIFACT="${2}"
+        if [ "${3:-}" = "--core" ]; then
+            core_only_install
+        else
+            quick_start_install
+        fi
+        ;;
     --verify-self) verify_self "${2:-$0}" ;;
     "")            main_menu ;;
     *)
-        echo "Usage: $0 [--quickstart | --core | --update | --check | --optimize | --uninstall | --status | --logs | --verify-self <path>]"
+        echo "Usage: $0 [--quickstart | --core | --offline <artifact> | --update | --check | --optimize | --uninstall | --status | --logs | --verify-self <path>]"
         exit 1
         ;;
 esac
