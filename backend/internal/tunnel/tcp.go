@@ -28,7 +28,7 @@ type TCPHandler struct {
 
 func NewTCPHandler(cfg *config.TunnelConfig) *TCPHandler {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &TCPHandler{cfg: cfg, ctx: ctx, cancel: cancel, pool: NewConnPool(DefaultMaxConcurrentHandshakes)}
+	return &TCPHandler{cfg: cfg, ctx: ctx, cancel: cancel, pool: NewConnPool(0)}
 }
 
 func (h *TCPHandler) Start() error {
@@ -76,6 +76,7 @@ func (h *TCPHandler) Start() error {
 
 func (h *TCPHandler) Stop() {
 	h.cancel()
+	h.pool.CloseAll()
 	h.mu.Lock()
 	for _, l := range h.listeners {
 		_ = l.Close()
@@ -98,14 +99,8 @@ func (h *TCPHandler) runIranListener(l net.Listener, psk []byte) {
 				continue
 			}
 		}
-		// Accept() is never blocked: the connection is immediately handed
-		// off to a new goroutine. Concurrency is capped *inside* that
-		// goroutine by acquiring a pool slot before dialing out, so at
-		// most DefaultMaxConcurrentHandshakes dial+handshake sequences run
-		// at the same time; anything beyond that queues here
-		// asynchronously until a slot frees up (thread-pool + async
-		// semantics, bounded parallel workers, unbounded backlog).
-		go func(c net.Conn) {
+		// Bound accepted sessions before spawning a worker.
+		h.pool.Run(clientConn, func(c net.Conn) {
 			defer c.Close()
 
 			if err := h.pool.Acquire(h.ctx); err != nil {
@@ -122,12 +117,15 @@ func (h *TCPHandler) runIranListener(l net.Listener, psk []byte) {
 
 			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
 			remoteAddr := net.JoinHostPort(h.cfg.RemoteIP, strconv.Itoa(h.cfg.RemotePort))
-			remoteConn, err := net.DialTimeout("tcp", remoteAddr, 10*time.Second)
+			dialer := &net.Dialer{Timeout: 10 * time.Second}
+			remoteConn, err := dialer.DialContext(h.ctx, "tcp", remoteAddr)
 			if err != nil {
 				system.LogError("TCP Iran connect to [%s]: %v", remoteAddr, err)
 				return
 			}
 			defer remoteConn.Close()
+			stopClose := context.AfterFunc(h.ctx, func() { _ = remoteConn.Close() })
+			defer stopClose()
 
 			// The mutual X25519 handshake performs a full round-trip
 			// (write msg1, read msg2) on remoteConn. A read/write deadline
@@ -150,12 +148,12 @@ func (h *TCPHandler) runIranListener(l net.Listener, psk []byte) {
 			release()
 
 			_ = c.SetDeadline(time.Time{})
-			ProxyBidirectional(c, secureConn, func(in, out int64) {
+			ProxyBidirectionalContext(h.ctx, c, secureConn, func(in, out int64) {
 				if config.GlobalConfig != nil {
 					_ = config.GlobalConfig.UpdateTunnelStats(h.cfg.ID, in, out)
 				}
 			})
-		}(clientConn)
+		})
 	}
 }
 
@@ -172,7 +170,7 @@ func (h *TCPHandler) runOverseasListener(l net.Listener, psk []byte) {
 				continue
 			}
 		}
-		go func(c net.Conn) {
+		h.pool.Run(incomingConn, func(c net.Conn) {
 			defer c.Close()
 
 			if err := h.pool.Acquire(h.ctx); err != nil {
@@ -197,7 +195,8 @@ func (h *TCPHandler) runOverseasListener(l net.Listener, psk []byte) {
 			}
 			defer secureConn.Close()
 			targetAddr := fmt.Sprintf("127.0.0.1:%d", h.cfg.TargetPort)
-			targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+			dialer := &net.Dialer{Timeout: 10 * time.Second}
+			targetConn, err := dialer.DialContext(h.ctx, "tcp", targetAddr)
 			if err != nil {
 				system.LogError("TCP Overseas connect to [%s]: %v", targetAddr, err)
 				return
@@ -207,11 +206,11 @@ func (h *TCPHandler) runOverseasListener(l net.Listener, psk []byte) {
 			release()
 
 			_ = c.SetDeadline(time.Time{})
-			ProxyBidirectional(secureConn, targetConn, func(in, out int64) {
+			ProxyBidirectionalContext(h.ctx, secureConn, targetConn, func(in, out int64) {
 				if config.GlobalConfig != nil {
 					_ = config.GlobalConfig.UpdateTunnelStats(h.cfg.ID, in, out)
 				}
 			})
-		}(incomingConn)
+		})
 	}
 }

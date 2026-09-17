@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -523,6 +524,10 @@ func LogsWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	stopClose := context.AfterFunc(r.Context(), func() { _ = conn.Close() })
+	defer stopClose()
+	conn.SetReadLimit(1024)
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	conn.SetPongHandler(func(string) error {
@@ -557,9 +562,12 @@ func LogsWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 
 	for {
 		select {
+		case <-r.Context().Done():
+			return
 		case <-done:
 			return
 		case <-ticker.C:
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
@@ -567,6 +575,7 @@ func LogsWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := conn.WriteJSON(msg); err != nil {
 				return
 			}

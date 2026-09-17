@@ -136,11 +136,10 @@ func StartServer(ctx context.Context, port int) error {
 	})
 
 	server := &http.Server{
-		Addr:         fmt.Sprintf("0.0.0.0:%d", port),
-		Handler:      mux,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              fmt.Sprintf("0.0.0.0:%d", port),
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {

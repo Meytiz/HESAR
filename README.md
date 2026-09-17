@@ -55,6 +55,52 @@
 
 ---
 
+## Security upgrade notes
+
+**Upgrade both tunnel peers together.** QUIC now requires a pinned client
+certificate as well as a pinned server certificate, using ALPN `hesar-quic/2`.
+Older peers are intentionally incompatible. Keep the same strong, randomly
+generated shared encryption key on both nodes. This authenticates membership
+in the shared-key group, not a unique identity for each node.
+
+**Panel transport (unchanged by design):** the panel intentionally remains
+plain HTTP on `0.0.0.0`. This is an explicit operator decision — credentials
+and JWTs travel unencrypted between the browser and the panel. If that is
+ever unacceptable, put an HTTPS reverse proxy in front of the panel port
+instead of changing the daemon. The server now sets `ReadHeaderTimeout` and
+`IdleTimeout`, and the SPA route sets `X-Content-Type-Options: nosniff` and
+`X-Frame-Options: DENY`.
+
+QUIC's experimental UDP relay is temporarily disabled because its flow routing
+and cleanup need redesign. Set `quic_enable_udp=false` before upgrading;
+attempting to start a tunnel with it enabled returns an explicit error.
+TCP application traffic over QUIC remains supported.
+
+Accepted/queued application sessions are capped at 256 per tunnel. Setup
+concurrency defaults to 10 and can be set with
+`HESAR_MAX_CONCURRENT_HANDSHAKES` (1–256); waiting for a slot is limited to
+10 seconds. QUIC servers also cap accepted peer connections at 32 per tunnel.
+These are application-level limits, not a replacement for firewall or
+transport-level resource protection.
+
+Stop closes accepted sessions and cancels active proxies. Idle timeout is
+measured across both directions (five minutes), with bounded writes.
+Start/stop operations are serialized; a stream-open timeout no longer tears
+down an otherwise healthy shared QUIC connection.
+
+Validation from the repository root:
+
+```text
+go -C backend build ./...
+go -C backend test -count=1 ./...
+go -C backend vet ./...
+go -C backend test -race ./...
+```
+
+The race detector requires a supported Go/CGO toolchain. Real deployment and
+performance tests on Linux are still needed; no throughput improvement is
+claimed from static review alone.
+
 ## 🌟 Overview
 
 **HESAR** is a lightweight, secure, and powerful tunneling solution that lets you route network traffic from a server inside a restricted network (e.g. behind a national firewall) to a server on the open internet — without DPI systems being able to detect or block it.
@@ -83,7 +129,7 @@ Shipped as a **single self-contained binary**, it provides:
 
 | Protocol | Description |
 |---|---|
-| **QUIC** | Primary transport. TCP connections become QUIC streams multiplexed over one TLS 1.3 connection; optional experimental UDP relay via QUIC DATAGRAM (RFC 9221). If UDP/QUIC is filtered, switch the tunnel protocol to TCP or KCP manually (no fallback transport) |
+| **QUIC** | TCP connections become streams on one mutually authenticated TLS 1.3 connection. Experimental UDP relay is temporarily disabled. If all UDP is unavailable, use TCP; KCP also requires UDP. |
 | **TCP** | Legacy encrypted TCP transport with AEAD framing (kept for compatibility) |
 | **KCP** | Legacy low-latency, reliable UDP tunnel (experimental) |
 

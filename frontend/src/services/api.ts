@@ -243,10 +243,17 @@ export const createLogWebSocket = (
   let ws: WebSocket | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
+  let reconnectAttempt = 0;
+  let openedAt = 0;
 
   const scheduleReconnect = () => {
-    if (disposed) return;
-    reconnectTimer = setTimeout(connect, 3000);
+    if (disposed || reconnectTimer) return;
+    const ceiling = Math.min(30000, 1000 * 2 ** Math.min(reconnectAttempt++, 5));
+    const delay = ceiling * (0.5 + Math.random() * 0.5);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      void connect();
+    }, delay);
   };
 
   const connect = async () => {
@@ -256,7 +263,8 @@ export const createLogWebSocket = (
     try {
       ticket = await authService.getWsTicket();
     } catch (err) {
-      console.error('[HESAR] Failed to obtain WebSocket ticket:', err);
+      const status = (err as AxiosError).response?.status;
+      if (status === 401 || status === 403) return;
       scheduleReconnect();
       return;
     }
@@ -270,6 +278,7 @@ export const createLogWebSocket = (
     ws = new WebSocket(url);
 
     ws.onopen = () => {
+      openedAt = Date.now();
       console.log('[HESAR] Log stream connected');
     };
 
@@ -284,9 +293,8 @@ export const createLogWebSocket = (
 
     ws.onclose = () => {
       if (!disposed) {
-        console.log(
-          '[HESAR] Log stream disconnected. Reconnecting in 3s...'
-        );
+        if (openedAt && Date.now() - openedAt >= 30000) reconnectAttempt = 0;
+        openedAt = 0;
         scheduleReconnect();
       }
     };

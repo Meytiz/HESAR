@@ -269,6 +269,7 @@ type SecureConn struct {
 	// ProxyBidirectional happens to use one writer per direction today,
 	// but a net.Conn-style API must be safe regardless.
 	writeMu sync.Mutex
+	readMu  sync.Mutex
 	// closeOnce makes Close idempotent and race-free: net.Conn users
 	// commonly close from multiple goroutines (defer + error path).
 	closeOnce sync.Once
@@ -363,6 +364,11 @@ func (s *SecureConn) Write(b []byte) (int, error) {
 }
 
 func (s *SecureConn) Read(b []byte) (int, error) {
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	if len(b) == 0 {
+		return 0, nil
+	}
 	if len(s.readBuffer) > 0 {
 		n := copy(b, s.readBuffer)
 		s.readBuffer = s.readBuffer[n:]
@@ -420,9 +426,12 @@ func (s *SecureConn) Read(b []byte) (int, error) {
 func (s *SecureConn) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
+		// Unblock a pending Read before waiting for ownership of its buffer.
+		err = s.Conn.Close()
+		s.readMu.Lock()
 		zero(s.readBuffer)
 		s.readBuffer = nil
-		err = s.Conn.Close()
+		s.readMu.Unlock()
 	})
 	return err
 }

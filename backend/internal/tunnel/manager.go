@@ -17,11 +17,8 @@ type TunnelHandler interface {
 
 // CentralManager owns the set of running tunnels.
 //
-// vNext hardening: StartTunnel now reserves the map slot BEFORE calling
-// handler.Start(), eliminating the previous TOCTOU window where two
-// concurrent StartTunnel calls for the same ID could both construct and
-// start handlers (double-listen on the same ports, orphaned handler
-// goroutines, corrupted status bookkeeping).
+// Lifecycle operations are serialized through completion, including status
+// persistence. Start only binds local listeners; network dialing is lazy.
 type CentralManager struct {
 	mu       sync.Mutex
 	handlers map[string]TunnelHandler
@@ -57,9 +54,7 @@ func newHandler(cfg *config.TunnelConfig) (TunnelHandler, error) {
 	}
 }
 
-// StartTunnel starts (or atomically restarts) the tunnel identified by
-// cfg.ID. The map slot is reserved under the manager lock before Start()
-// runs, so concurrent starts of the same tunnel are serialized.
+// StartTunnel serializes start/restart against stop and shutdown.
 func (m *CentralManager) StartTunnel(cfg *config.TunnelConfig) error {
 	handler, err := newHandler(cfg)
 	if err != nil {
@@ -67,21 +62,19 @@ func (m *CentralManager) StartTunnel(cfg *config.TunnelConfig) error {
 	}
 
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	if existing, ok := m.handlers[cfg.ID]; ok {
 		existing.Stop()
 		delete(m.handlers, cfg.ID)
 	}
-	m.handlers[cfg.ID] = handler // reserve slot before Start()
-	m.mu.Unlock()
-
 	if err := handler.Start(); err != nil {
-		m.mu.Lock()
-		if m.handlers[cfg.ID] == handler {
-			delete(m.handlers, cfg.ID)
+		handler.Stop()
+		if config.GlobalConfig != nil {
+			_ = config.GlobalConfig.UpdateTunnelStatus(cfg.ID, "inactive")
 		}
-		m.mu.Unlock()
 		return err
 	}
+	m.handlers[cfg.ID] = handler
 
 	if config.GlobalConfig != nil {
 		_ = config.GlobalConfig.UpdateTunnelStatus(cfg.ID, "active")
@@ -92,13 +85,12 @@ func (m *CentralManager) StartTunnel(cfg *config.TunnelConfig) error {
 // StopTunnel stops a running tunnel.
 func (m *CentralManager) StopTunnel(id string) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	handler, exists := m.handlers[id]
 	if !exists {
-		m.mu.Unlock()
 		return errors.New("tunnel is not running")
 	}
 	delete(m.handlers, id)
-	m.mu.Unlock()
 
 	handler.Stop()
 	if config.GlobalConfig != nil {
@@ -117,9 +109,9 @@ func (m *CentralManager) GetActiveTunnelsCount() int {
 // StopAll stops every running tunnel (graceful shutdown path).
 func (m *CentralManager) StopAll() {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	handlers := m.handlers
 	m.handlers = make(map[string]TunnelHandler)
-	m.mu.Unlock()
 
 	for id, handler := range handlers {
 		handler.Stop()

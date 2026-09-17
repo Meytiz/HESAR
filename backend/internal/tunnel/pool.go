@@ -2,116 +2,87 @@ package tunnel
 
 import (
 	"context"
+	"net"
 	"os"
 	"strconv"
+	"sync"
+	"time"
 )
 
-// DefaultMaxConcurrentHandshakes is the default number of connections that
-// may be *established* (outbound Dial + secure handshake, or inbound
-// handshake + local dial) at the same time, per tunnel instance.
-//
-// Background
-// ----------
-// Every listener in this package (TCP, KCP, QUIC, TLS-fallback) used to do
-// this on every single Accept():
-//
-//	go func(c net.Conn) {
-//	    remoteConn, _ := net.DialTimeout(...)      // outbound dial
-//	    secureConn, _ := crypto.NewSecureConn(...) // X25519 + ChaCha20 handshake
-//	    ProxyBidirectional(...)
-//	}(clientConn)
-//
-// i.e. an *unbounded* number of goroutines could be spawned instantly, each
-// immediately opening a brand-new outbound TCP/KCP socket and performing a
-// full asymmetric key-exchange + AEAD handshake. Under normal load this is
-// fine, but:
-//
-//   - A burst of incoming connections (many parallel xray/VLESS/VMess
-//     sub-connections, a client reconnect storm, or a deliberate flood)
-//     causes an equally large burst of *simultaneous* outbound dials and
-//     crypto handshakes, spiking CPU/FD/socket usage with no back-pressure.
-//   - That burst is also an easy DPI / traffic-fingerprinting signal — a
-//     restricted-network firewall can flag a host that suddenly opens many
-//     parallel connections to the same overseas IP at once.
-//   - There was no limit at all: resource usage was bounded only by the OS
-//     (file descriptors, ephemeral ports, memory).
-//
-// The fix implemented in this file is a small, dependency-free "worker
-// pool": a buffered channel used as a semaphore that bounds how many
-// dial+handshake operations may be *in flight* at once (default: 10),
-// while Accept() itself is never blocked and extra connections simply
-// queue asynchronously until a slot frees up. As soon as a connection's
-// handshake succeeds, its slot is released immediately — *before* the
-// (potentially long-lived) bidirectional proxy loop starts — so already
-// established tunnel sessions are never limited in number or throughput;
-// only the *rate of new connection setups* is capped.
-//
-// This file is a hard build dependency of tcp.go, kcp.go and quic.go —
-// those three transports all hold a *ConnPool and call Acquire/Release
-// around their connection-establishment path.
 const DefaultMaxConcurrentHandshakes = 10
-
-// envMaxConcurrentHandshakes lets an operator override the pool size
-// without recompiling, e.g.:
-//
-//	HESAR_MAX_CONCURRENT_HANDSHAKES=25 ./hesar -config data/config.json
 const envMaxConcurrentHandshakes = "HESAR_MAX_CONCURRENT_HANDSHAKES"
+const maxSessionsPerTunnel = 256
 
-// ConnPool is a bounded, async worker pool used to throttle concurrent
-// connection-establishment work (outbound Dial + secure handshake).
-//
-// Go multiplexes goroutines onto OS threads automatically, so the
-// "thread-pool" behaviour requested is implemented the idiomatic Go way: a
-// fixed-size semaphore built from a buffered channel. This gives the same
-// guarantee a classic thread pool gives — at most N units of work run
-// concurrently, everything else queues asynchronously with zero
-// busy-waiting — without fighting Go's scheduler.
+// ConnPool bounds both setup concurrency and accepted sessions (including
+// queued sessions). Admission occurs before spawning a worker goroutine.
 type ConnPool struct {
 	sem chan struct{}
+	mu sync.Mutex
+	sessions map[net.Conn]struct{}
+	stopped bool
 }
 
-// NewConnPool creates a pool that allows at most size concurrent
-// Acquire()-ed slots. If size <= 0, DefaultMaxConcurrentHandshakes (10) is
-// used, unless overridden by the HESAR_MAX_CONCURRENT_HANDSHAKES env var.
 func NewConnPool(size int) *ConnPool {
 	if size <= 0 {
 		size = DefaultMaxConcurrentHandshakes
-		if v := os.Getenv(envMaxConcurrentHandshakes); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				size = n
-			}
+		if n, err := strconv.Atoi(os.Getenv(envMaxConcurrentHandshakes)); err == nil && n > 0 && n <= maxSessionsPerTunnel {
+			size = n
 		}
 	}
-	return &ConnPool{sem: make(chan struct{}, size)}
+	return &ConnPool{sem: make(chan struct{}, size), sessions: make(map[net.Conn]struct{})}
 }
 
-// Acquire waits (from the caller's goroutine — it never blocks the
-// Accept() loop, since it is always invoked from inside a freshly spawned
-// goroutine) until a pool slot is free, or ctx is cancelled (e.g. the
-// tunnel is being stopped).
+// Run rejects excess sessions immediately; no unbounded goroutine backlog.
+func (p *ConnPool) Run(c net.Conn, serve func(net.Conn)) bool {
+	p.mu.Lock()
+	if p.stopped || len(p.sessions) >= maxSessionsPerTunnel {
+		p.mu.Unlock()
+		_ = c.Close()
+		return false
+	}
+	p.sessions[c] = struct{}{}
+	p.mu.Unlock()
+	go func() {
+		defer func() {
+			_ = c.Close()
+			p.mu.Lock()
+			delete(p.sessions, c)
+			p.mu.Unlock()
+		}()
+		serve(c)
+	}()
+	return true
+}
+
+// CloseAll closes raw accepted connections, unblocking pending reads/writes.
+// Once stopped, a pool never admits another session.
+func (p *ConnPool) CloseAll() {
+	p.mu.Lock()
+	p.stopped = true
+	for c := range p.sessions {
+		_ = c.Close()
+	}
+	p.mu.Unlock()
+}
+
 func (p *ConnPool) Acquire(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case p.sem <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			p.Release()
+			return err
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-// Release frees a previously Acquire()-ed slot. Safe to call at most once
-// per successful Acquire call (handlers guard this with a small
-// "released" flag — see tcp.go/kcp.go/quic.go).
-func (p *ConnPool) Release() {
-	<-p.sem
-}
-
-// InUse returns how many slots are currently taken (handy for
-// metrics/logging/dashboard widgets).
-func (p *ConnPool) InUse() int {
-	return len(p.sem)
-}
-
-// Cap returns the configured pool size.
-func (p *ConnPool) Cap() int {
-	return cap(p.sem)
-}
+func (p *ConnPool) Release() { <-p.sem }
+func (p *ConnPool) InUse() int { return len(p.sem) }
+func (p *ConnPool) Cap() int { return cap(p.sem) }

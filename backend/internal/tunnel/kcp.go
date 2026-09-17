@@ -28,7 +28,7 @@ type KCPHandler struct {
 
 func NewKCPHandler(cfg *config.TunnelConfig) *KCPHandler {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &KCPHandler{cfg: cfg, ctx: ctx, cancel: cancel, pool: NewConnPool(DefaultMaxConcurrentHandshakes)}
+	return &KCPHandler{cfg: cfg, ctx: ctx, cancel: cancel, pool: NewConnPool(0)}
 }
 
 func applyKCPOptions(sess *kcp.UDPSession, mode string) {
@@ -93,6 +93,7 @@ func (h *KCPHandler) Start() error {
 
 func (h *KCPHandler) Stop() {
 	h.cancel()
+	h.pool.CloseAll()
 	h.mu.Lock()
 	for _, l := range h.listeners {
 		_ = l.Close()
@@ -115,7 +116,7 @@ func (h *KCPHandler) runIranListener(l net.Listener, psk []byte) {
 				continue
 			}
 		}
-		go func(c net.Conn) {
+		h.pool.Run(clientConn, func(c net.Conn) {
 			defer c.Close()
 
 			if err := h.pool.Acquire(h.ctx); err != nil {
@@ -139,6 +140,8 @@ func (h *KCPHandler) runIranListener(l net.Listener, psk []byte) {
 				return
 			}
 			defer kcpConn.Close()
+			stopClose := context.AfterFunc(h.ctx, func() { _ = kcpConn.Close() })
+			defer stopClose()
 			applyKCPOptions(kcpConn, h.cfg.KCPMode)
 
 			// The X25519 handshake performs a full read/write round-trip
@@ -158,12 +161,12 @@ func (h *KCPHandler) runIranListener(l net.Listener, psk []byte) {
 			release()
 
 			_ = c.SetDeadline(time.Time{})
-			ProxyBidirectional(c, secureConn, func(in, out int64) {
+			ProxyBidirectionalContext(h.ctx, c, secureConn, func(in, out int64) {
 				if config.GlobalConfig != nil {
 					_ = config.GlobalConfig.UpdateTunnelStats(h.cfg.ID, in, out)
 				}
 			})
-		}(clientConn)
+		})
 	}
 }
 
@@ -184,7 +187,7 @@ func (h *KCPHandler) runOverseasListener(l net.Listener, psk []byte) {
 		if ok {
 			applyKCPOptions(kcpSess, h.cfg.KCPMode)
 		}
-		go func(c net.Conn) {
+		h.pool.Run(incomingConn, func(c net.Conn) {
 			defer c.Close()
 
 			if err := h.pool.Acquire(h.ctx); err != nil {
@@ -209,7 +212,8 @@ func (h *KCPHandler) runOverseasListener(l net.Listener, psk []byte) {
 			}
 			defer secureConn.Close()
 			targetAddr := fmt.Sprintf("127.0.0.1:%d", h.cfg.TargetPort)
-			targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+			dialer := &net.Dialer{Timeout: 10 * time.Second}
+			targetConn, err := dialer.DialContext(h.ctx, "tcp", targetAddr)
 			if err != nil {
 				system.LogError("KCP Overseas connect to [%s]: %v", targetAddr, err)
 				return
@@ -219,11 +223,11 @@ func (h *KCPHandler) runOverseasListener(l net.Listener, psk []byte) {
 			release()
 
 			_ = c.SetDeadline(time.Time{})
-			ProxyBidirectional(secureConn, targetConn, func(in, out int64) {
+			ProxyBidirectionalContext(h.ctx, secureConn, targetConn, func(in, out int64) {
 				if config.GlobalConfig != nil {
 					_ = config.GlobalConfig.UpdateTunnelStats(h.cfg.ID, in, out)
 				}
 			})
-		}(incomingConn)
+		})
 	}
 }
