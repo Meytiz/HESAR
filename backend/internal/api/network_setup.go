@@ -43,6 +43,7 @@ func NetworkRuntimeHandler(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "GET required", 405)
 		return
 	}
+	w.Header().Set("Content-Type", "application/json")
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 	reply, err := provision.Call(ctx, "status", provision.Request{})
@@ -108,6 +109,7 @@ func NetworkKeysHandler(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "random generation failed", 500)
 		return
 	}
+	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = jsonEncode(w, map[string]string{"carrier_auth": hex.EncodeToString(random[:32]), "carrier_obfs": hex.EncodeToString(random[32:64]), "reality_private_key": base64.RawURLEncoding.EncodeToString(xkey.Bytes()), "reality_public_key": base64.RawURLEncoding.EncodeToString(xkey.PublicKey().Bytes()), "reality_short_id": hex.EncodeToString(random[64:]), "tls_cert_pem": string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})), "tls_key_pem": string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})), "server_name": name})
 }
@@ -173,7 +175,11 @@ func NetworkPeerHandler(w http.ResponseWriter, r *http.Request) {
 	peer.UnderlayInterface = ""
 	peer.ProxyURL = ""
 	peer.RemoteIP = local
-	peer.CarrierPeerIP = local
+	if ip := net.ParseIP(local); ip != nil && ip.To4() != nil {
+		peer.CarrierPeerIP = local
+	} else {
+		peer.CarrierPeerIP = ""
+	}
 	peer.CarrierLocalIP = original.CarrierPeerIP
 	peer.CarrierLocalInner, peer.CarrierRemoteInner = original.CarrierRemoteInner, original.CarrierLocalInner
 	peer.TLSCAPEM = original.TLSCertPEM
@@ -196,6 +202,7 @@ func NetworkPeerHandler(w http.ResponseWriter, r *http.Request) {
 		peer.RealityPublicKey = base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes())
 	}
 	peer.RealityPrivateKey = ""
+	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = jsonEncode(w, map[string]any{"version": 1, "tunnel": peer, "notice": fmt.Sprintf("Contains private peer credentials for %s; import only into your Iran panel.", original.Name)})
 }

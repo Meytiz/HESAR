@@ -209,7 +209,7 @@ func RunQUICTest(targetIP string, port int) TestResult {
 
 	conn, err := quic.DialAddr(ctx, addr, &tls.Config{
 		InsecureSkipVerify: true,
-		NextProtos:         []string{"hq-29", "h3", "hesar-quic/1"},
+		NextProtos:         []string{"hesar-quic/2", "hesar-auto/1", "hq-29", "h3", "hesar-quic/1"},
 	}, &quic.Config{
 		HandshakeIdleTimeout: probeQUICTimeout,
 	})

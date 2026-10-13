@@ -1,162 +1,120 @@
 # HESAR
 
-انتقال ترافیک **TCP** بین سرور ایران و خارج با پنل **HTTP** و تنظیم پروتکل‌ها از داخل پنل. بسته Linux شامل HESAR، عامل محلی مدیریت شبکه و هسته‌های Paqet، Xray و Hysteria است. سرورها به Go، Node، بیلد سورس، ویرایش کانفیگ هسته یا اجرای دستی دستور GRE نیاز ندارند.
+پلتفرم تانل معکوس و مدیریت مسیر شبکه برای اتصال سرور ایران (Bridge) و سرور خارج (Overseas) از طریق یک پنل وب یکپارچه.
 
-هیچ پروتکلی عبور قطعی از DPI، allowlist، قطع اینترنت یا محدودیت IP را تضمین نمی‌کند. نتیجه یک مسیر یا یک جهت GRE را نمی‌توان به همه ایران تعمیم داد. [منابع و روش تحقیق](docs/iran-dpi-research.fa.md).
+> هیچ پروتکلی عبور قطعی از تمام انواع فیلترینگ، محدودیت‌های مسیر یا اختلال‌های لایه شبکه را تضمین نمی‌کند. پروفایل‌های متنوع در HESAR برای تطبیق سریع با شرایط مختلف شبکه طراحی شده‌اند.
 
-## مسیرهای قابل انتخاب
+---
 
-| پروفایل | حمل ترافیک | تنظیم با Start از پنل |
+## نصب سریع روی سرور لینوکس (Easy & Manual Install)
+
+نصب HESAR نیازی به نصب Go، Node.js، کامپایلر یا تنظیم دستی فایل‌های کانفیگ روی سرور ندارد. بسته کامل انتشار شامل باینری پنل (`hesar`)، ایجنت محلی شبکه (`hesar-agent`) و هسته‌های مدیریت‌شده (`paqet`، `xray` و `hysteria`) است.
+
+### ۱) نصب تعاملی با منوی مدیریت (پیشنهادی - مشابه شاخه `main`)
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Meytiz/HESAR/main/scripts/hesar.sh)
+```
+
+از طریق این منو می‌توانید نصب آنلاین، نصب دستی/آفلاین، بررسی وضعیت سرویس‌ها، فعال‌سازی بهینه‌سازی کرنل و TCP BBR، مشاهده اطلاعات ورود به پنل و حذف کامل را انجام دهید.
+
+### ۲) نصب خودکار تک‌خطی (بدون پرسش)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Meytiz/HESAR/main/scripts/install-hesar.sh | sudo bash
+```
+
+### ۳) نصب دستی / آفلاین (مناسب سرورهای ایران بدون دسترسی مستقیم به GitHub)
+
+فایل `hesar-linux-amd64.tar.gz` (یا `hesar-linux-arm64.tar.gz`) و اسکریپت `install-hesar.sh` (یا `hesar.sh`) را از بخش **GitHub Releases** دانلود کرده و به سرور منتقل کنید (مثلاً در `/root`):
+
+```bash
+sudo bash install-hesar.sh --offline /root/hesar-linux-amd64.tar.gz
+```
+
+یا اگر فایل `.tar.gz` در کنار اسکریپت در همان پوشه قرار داشته باشد:
+
+```bash
+sudo bash install-hesar.sh
+```
+
+### دستورات مدیریتی کاربردی
+
+```bash
+sudo bash install-hesar.sh --status        # وضعیت سرویس‌های hesar و hesar-agent
+sudo bash install-hesar.sh --credentials   # نمایش آدرس پنل و رمز عبور اولیه
+sudo bash install-hesar.sh --optimize      # فعال‌سازی TCP BBR و بهینه‌سازی بافرهای شبکه
+sudo bash install-hesar.sh --logs          # مشاهده لاگ‌های زنده سرویس
+sudo bash install-hesar.sh --update        # به‌روزرسانی به آخرین نسخه انتشار
+sudo bash install-hesar.sh --uninstall     # توقف و حذف سرویس‌ها
+```
+
+پس از اتمام نصب، آدرس پنل (`http://SERVER_IP:8443`)، نام کاربری (`admin`) و رمز عبور اولیه مستقیماً در ترمینال نمایش داده شده و در مسیر `/etc/hesar/credentials.txt` نیز ذخیره می‌شود.
+
+---
+
+## راه‌اندازی تانل از داخل پنل وب
+
+تمام مراحل ساخت تانل، تولید کلیدهای رمزنگاری، تنظیم هسته‌های مدیریت‌شده و خروجی گرفتن کانفیگ سرور مقابل از داخل پنل وب انجام می‌شود.
+
+### گام اول: تنظیم سرور خارج (Overseas)
+
+۱. وارد پنل سرور خارج شوید و به بخش **Tunnels → Add New Tunnel** بروید.
+۲. فیلد **Server Side Role** را روی `Overseas (Node / Listener)` قرار دهید.
+۳. از بخش **Network Profile Preset** یکی از پروفایل‌های زیر را متناسب با شرایط شبکه انتخاب کنید:
+
+| پروفایل | پروتکل / حامل | کاربرد پیشنهادی |
 |---|---|---|
-| Auto | QUIC → WSS در شکست راه‌اندازی | انتخاب پیش از ارسال داده و cooldown |
-| WSS / TLS fragmentation | TLS 1.3 و WebSocket | گواهی PEM، CA و قطعه‌بندی اختیاری |
-| Shaped WSS، آزمایشی | WSS با padding محدود | تغییر طول برخی ارسال‌ها با هزینه پهنای باند |
-| QUIC / TCP / KCP | transport داخلی احرازشده | listener و اتصال به مقصد |
-| GRE / IPIP | لایه ۳ همراه TCP، QUIC یا KCP | لینک، IP خصوصی، MTU و policy route محدود |
-| Paqet | TCP خام، KCP و SOCKS5 داخلی | تشخیص کارت/IP/MAC، قواعد محدود و اجرای هسته |
-| REALITY/XHTTP | Xray: VLESS + XHTTP + REALITY | کلیدها، کانفیگ هسته و SOCKS5 خصوصی |
-| Hysteria 2 | QUIC + Salamander | گواهی، CA، کلید مستقل obfs و هسته |
+| `Balanced (Auto QUIC/WSS)` | `auto` | شروع با QUIC و سوییچ خودکار به WSS در صورت اختلال UDP |
+| `TCP / CDN Compatible (WSS)` | `wss` | مسیرهای TCP-only با گواهی TLS پین‌شده |
+| `Fragmented TLS Handshake (WSS)` | `wss` | خرد کردن رکوردهای اولیه TLS ClientHello |
+| `Shaped WSS (Padded Frames)` | `wss-shaped` | پدینگ فریم‌های باینری WebSocket روی TLS |
+| `Lossy UDP / High RTT (QUIC)` | `quic` | مسیرهای UDP ناپایدار با غیرفعال‌سازی PMTU Discovery |
+| `Raw Packet Bypass (Managed Paqet)` | `paqet + quic` | تانل سطح پکت خام KCP مدیریت‌شده توسط ایجنت |
+| `XHTTP + REALITY (Managed Xray)` | `xray + tcp` | تانل VLESS + XHTTP + REALITY مدیریت‌شده توسط ایجنت |
+| `UDP Obfuscated (Managed Hysteria 2)` | `hysteria + tcp` | تانل QUIC با مبهم‌سازی Salamander مدیریت‌شده توسط ایجنت |
+| `Layer-3 GRE + HESAR` | `gre + quic` | رابط نقطه‌به‌نقطه GRE لایه ۳ + تانل داخلی HESAR |
+| `Layer-3 IPIP + HESAR` | `ipip + quic` | رابط نقطه‌به‌نقطه IPIP لایه ۳ + تانل داخلی HESAR |
 
-GRE/IPIP به‌تنهایی رمزنگاری ندارند؛ HESAR روی آن‌ها احراز هویت و رمزنگاری می‌کند. QUIC داخلی ALPN اختصاصی دارد و HTTP/3 نیست. ترافیک UDP برنامه‌ها در این نسخه پشتیبانی نمی‌شود. Auto اتصال فعال را بین مسیرها جابه‌جا یا داده را دوباره ارسال نمی‌کند.
+۴. آی‌پی عمومی سرور ایران را در **Other Server WAN IPv4**، پورت تانل را در **Connection Listen Port** و پورت سرویس مقصد محلی را در **Target Forward Port** وارد کنید.
+۵. روی **Generate transport credentials** کلیک کنید تا کلید رمزنگاری، گواهی TLS و کلیدهای REALITY/Salamander/Paqet به‌صورت خودکار تولید شوند.
+۶. تانل را ذخیره کرده، روی **Start** بزنید و سپس روی کارت تانل دکمه **Copy peer setup** را بزنید.
 
-## بیلد و انتشار، فقط در GitHub
+### گام دوم: تنظیم سرور ایران (Iran)
 
-۱. محتوای سورس را در **ریشه مخزن** قرار دهید، همراه `.github`، فایل‌های lock و تست‌ها. پوشه بیرونی ZIP یا `HESAR-final` را به‌عنوان زیرپوشه مخزن آپلود نکنید. در مخزن موجود:
+۱. وارد پنل سرور ایران شوید و در صفحه **Tunnels** روی **Import peer setup** کلیک کنید.
+۲. متن JSON کپی‌شده از سرور خارج را جای‌گذاری کرده و روی **Apply peer setup** بزنید.
+۳. پورت‌های ورودی کاربران در سرور ایران را در **Local Listen Port(s)** تنظیم کنید (مثلاً `443` یا `80,443` یا `10000-10010`).
+۴. تانل را ذخیره کرده و روی **Start** کلیک کنید.
 
-```bash
-git switch -c codex/panel-managed
-git add -A
-git commit -m "Manage tunnel carriers through the panel"
-git push -u origin codex/panel-managed
-```
+---
 
-۲. در GitHub برای این branch یک Pull Request به `main` باز کنید. **Actions → CI** را بررسی کنید. `ci.yml` روی push، PR و اجرای دستی، پنل و دو باینری HESAR را می‌سازد، هسته‌ها را با نسخه و SHA-256 ثابت می‌گیرد، تست‌ها را اجرا می‌کند و بسته‌های کامل amd64/arm64 را در **Artifacts** همان اجرا می‌گذارد.
-
-۳. پس از موفقیت CI و ادغام، tag جدید و استفاده‌نشده بسازید:
-
-```bash
-git switch main
-git pull --ff-only
-git tag v2.1.0
-git push origin v2.1.0
-```
-
-`v2.1.0` مثال است؛ تکرار tag قبلی مجاز نیست. `build.yml` با tagهای `v*` دوباره تست و بیلد می‌گیرد، manifest و نصب‌کننده را با Sigstore امضا می‌کند و Release می‌سازد. GitHub Actions باید فعال باشد؛ job انتشار مجوز `contents: write` و `id-token: write` دارد.
-
-۴. فایل‌های Release:
-
-- `hesar-linux-amd64.tar.gz` و `hesar-linux-arm64.tar.gz`: HESAR، عامل، سه هسته، مجوزها و مستندات.
-- `install-hesar.sh`: نصب‌کننده با نام مخزن و هویت امضای همان workflow.
-- `checksums-sha256.txt`، امضاهای Sigstore و `BUILDINFO.json`.
-
-اگر Cosign روی میزبان نصب باشد، دانلود آنلاین manifest امضا و هویت workflow را بررسی می‌کند. بدون Cosign، SHA-256 فقط سلامت داده را بررسی می‌کند؛ ناشر احراز نمی‌شود. artifact آزمایشی CI و بسته QA محلی امضای Release ندارند.
-
-بیلد تولیدی، دریافت هسته‌ها و بسته‌بندی در GitHub انجام می‌شوند. باینری، `node_modules`، خروجی پنل، لاگ و کانفیگ خصوصی وارد Git نمی‌شوند. تست‌های `*_test.go` و تست نصب/شبکه برای CI لازم‌اند و داخل بسته اجرایی سرور قرار نمی‌گیرند.
-
-## نصب اولیه روی هر دو سرور
-
-میزبان پشتیبانی‌شده: **Debian 12+ یا Ubuntu 24.04+ با systemd**، amd64 یا arm64 و IPv4 قابل دسترس. نصب‌کننده Python 3.11+، iproute2، iptables، ping و وابستگی‌های اجرا را نصب می‌کند.
-
-از Release همان مخزن، `install-hesar.sh`، آرشیو معماری صحیح و `checksums-sha256.txt` را کنار هم روی هر سرور بگذارید. سپس:
-
-```bash
-sudo bash install-hesar.sh --offline ./hesar-linux-amd64.tar.gz
-```
-
-`--offline` یعنی آرشیو برنامه محلی است؛ اگر وابستگی‌ها نصب نباشند، نصب بسته‌های سیستم به مخزن apt نیاز دارد. اگر آرشیو محلی ندارید، `sudo bash install-hesar.sh --quickstart` بسته کامل latest همان مخزن را دریافت می‌کند. نصب و به‌روزرسانی عملیات یک‌باره سیستمی‌اند؛ **انتخاب، کانفیگ، Start و Stop همه پروتکل‌ها از پنل است**.
-
-پنل پیش‌فرض: **`http://SERVER_IP:8443`**؛ کاربر اولیه `admin` است. رمز تصادفی یک‌بار هنگام ایجاد تنظیمات در journal نوشته می‌شود:
-
-```bash
-sudo journalctl -u hesar -n 50 --no-pager
-```
-
-پس از ورود، رمز را از Settings تغییر دهید. پنل طبق طراحی HTTP می‌ماند؛ رمزها و JSON تنظیمات را فقط از مسیر مدیریتی مورد اعتماد خود منتقل کنید.
-
-نصب‌کننده پیش از فعال کردن نسل جدید، کامل بودن پنج باینری، معماری ELF و checksum اعضا را بررسی می‌کند. کانفیگ `/etc/hesar/data/config.json` حفظ می‌شود. نصب دوباره آرشیو یکسان تکرارپذیر است. نسل‌های قبلی برای بازیابی باقی می‌مانند و خودکار حذف نمی‌شوند.
-
-## راه‌اندازی از پنل
-
-همیشه **سرور خارج را اول** تنظیم کنید:
-
-1. **Tunnels → Add New Tunnel → Server Side Role: Overseas**.
-2. **Network profile** را انتخاب کنید. برای مسیرهای مدیریت‌شده، IP ایران را در **Other server WAN IPv4** بدهید. کارت و IP محلی خودکار تشخیص داده می‌شوند؛ override باید واقعاً روی همان میزبان اختصاص یافته باشد.
-3. **Connection Listen Port / Internal transport port** را مثلاً `18081` و **Target Forward Port** را پورت واقعی برنامه مقصد، مثلاً `8080` قرار دهید. Target host پیش‌فرض `127.0.0.1` است.
-4. **Generate encryption key** را بزنید. برای Paqet، REALITY و مسیرهای TLS، **Generate transport credentials** را نیز بزنید. گواهی معتبر خود را هم می‌توانید به شکل PEM در پنل وارد کنید.
-5. **Save Tunnel Configuration → Start**. شروع موفق یعنی منابع محلی آماده‌اند؛ هنوز سلامت ارتباط دو سرور ثابت نشده است.
-6. در کارت تونل **Copy peer setup** را بزنید. JSON را به پنل ایران ببرید: **Import peer setup → Apply peer setup**.
-7. روی ایران نام و **Local Listen Port(s)**، مثلاً `18080`، را بررسی کنید. کلیدهای مشترک، CA و IPهای خصوصی خودکار وارد می‌شوند. **Save → Start**.
-
-JSON شامل کلیدهای مشترک است؛ آن را در GitHub یا لاگ عمومی نگذارید. کلید خصوصی گواهی خارج و کلید خصوصی REALITY به ایران صادر نمی‌شوند. فهرست تونل‌ها کلیدهای حساس را پنهان می‌کند؛ ویرایش مقدار پنهان‌شده، کلید ذخیره‌شده را حفظ می‌کند.
-
-## GRE و IPIP
-
-پروفایل GRE یا IPIP را روی خارج انتخاب کنید. پیش‌فرض خارج `10.77.0.2` و ایران `10.77.0.1` است؛ export جای آن‌ها را برای ایران عوض می‌کند. MTU آغازین `1280` است؛ QUIC حداقل `1228` می‌خواهد و PMTU برای L3 خاموش می‌شود.
-
-قواعد فایروال محلی برای IP/پروتکل/پورت همان تونل نیز با شناسه مالکیت ایجاد و در Stop حذف می‌شوند. سیاست کلی INPUT/OUTPUT تغییر نمی‌کند؛ قاعده پذیرش متعلق به تونل پیش از رد عمومی قرار می‌گیرد.
-
-Start لینک با نام مشتق‌شده از ID، source route مخصوص همان دو IP و listener محدود به IP خصوصی می‌سازد. مسیر پیش‌فرض میزبان تغییر نمی‌کند. Stop منابع متعلق به همان تونل را جمع می‌کند. دستور `ip tunnel`، نام کارت و جدول route را دستی وارد نکنید. برای چند تونل هم‌زمان، جفت IP خصوصی متفاوت انتخاب کنید، مثلاً `10.77.1.1/10.77.1.2`؛ پورت‌های listener هم نباید تداخل داشته باشند.
-
-**GRE پروتکل IP شماره 47 و IPIP شماره 4 است؛ پورت TCP/UDP نیستند.** ACL دیتاسنتر باید عبور دوطرفه را اجازه دهد. عامل محلی نمی‌تواند ACL بیرون ماشین، NAT ناسازگار یا محدودیت اپراتور را تغییر دهد. دانلود موفق بدون آپلود، تأیید مسیر نیست.
-
-## Paqet
-
-پروفایل Paqet را انتخاب کنید. **Carrier public port** باید اختصاصی و حداقل `1024` باشد، مثلاً `19999`. از پورت سرویس دیگر استفاده نکنید. کلید Paqet را از پنل بسازید؛ از کلید داخلی HESAR مستقل است.
-
-عامل کارت/IP/MAC next hop را از route و neighbor پیدا می‌کند. قواعد NOTRACK و جلوگیری از RST فقط برای همان peer، IP و پورت با comment مالکیت درج می‌شوند. هسته با UID محدود HESAR و قابلیت‌های NET_RAW/NET_ADMIN اجرا می‌شود. Stop قواعد خود همان تونل را حذف می‌کند؛ اجرای دستی `iptables`، YAML و Paqet لازم نیست.
-
-این مسیر به packet capture، next hop قابل کشف و عبور TCP خام نیاز دارد. container بدون capability، NAT و فایروال stateful ممکن است ناسازگار باشند. نسخه همراه **alpha** است. خطای Start را از شکست انتقال روی مسیر جدا بررسی کنید.
-
-## REALITY/XHTTP و Hysteria
-
-**Xray:** دامنه پوشش TLS 1.3 قابل دسترس را در **REALITY cover server name** بدهید و کلید بسازید. `REALITY target` اختیاری است؛ پیش‌فرض همان دامنه روی 443 است. پورت عمومی می‌تواند 443 باشد؛ پورت داخلی HESAR را **متفاوت**، مثلاً `18081` قرار دهید. خروجی Xray فقط TCP به `127.0.0.1:InternalPort` را اجازه می‌دهد. شروع listener دسترسی به دامنه پوشش را ثابت نمی‌کند.
-
-**Hysteria:** نام گواهی و کلیدهای انتقال را بسازید. Salamander کلید مستقل دارد. export گواهی اعتماد را به ایران می‌دهد؛ `insecure` روشن نمی‌شود. این مسیر UDP است و UDP کاملاً مسدود را قابل استفاده نمی‌کند.
-
-گواهی خصوصی تولیدشده از پنل **۹۰ روز** اعتبار دارد. برای تمدید، گواهی/کلید جدید را روی خارج بسازید و ذخیره کنید. روی ایران، تونل قدیمی را Stop کنید، JSON تازه را import و Start کنید و پس از تست، رکورد قدیمی را حذف کنید. ACME در این نسخه پیاده نشده؛ PEM معتبر از پنل قابل ورود است. گواهی خصوصی خودساخته معادل گواهی عمومی وب نیست.
-
-## Shaped WSS، آزمایشی
-
-رکورد جریان داخل WSS payload حداکثر 16KiB و padding حداکثر 1152 بایت دارد. بعضی ارسال‌های کوچک به bucket طول مشخص با jitter تصادفی تبدیل می‌شوند. دریافت محدود است؛ TLS و AEAD موجود حفاظت داده را انجام می‌دهند. هر دو طرف باید همین پروتکل را انتخاب کنند.
-
-ادعای **روش منتشرنشده در جهان، تقلید کامل مرورگر یا مقاومت قطعی** نداریم. padding ایده‌ای شناخته‌شده است؛ این نسخه پیاده‌سازی قابل آزمون خودش را دارد. Go ClientHello، WebSocket و زمان‌بندی همچنان قابل تحلیل‌اند؛ padding می‌تواند هزینه یا الگوی قابل تشخیص دیگری ایجاد کند. WSS معمولی و Shaped WSS را با مقصد، ساعت و حجم یکسان مقایسه کنید و فقط با نتیجه بهتر از آن استفاده کنید.
-
-## آزمون و عیب‌یابی
-
-Tester پنل TCP/TLS/QUIC را برای مقصدهای عمومی می‌سنجد؛ timeout یا handshake موفق اثبات DPI یا سلامت تونل نیست. هدف‌های خصوصی/metadata در Tester عمومی رد می‌شوند.
-
-به پورت محلی ایران درخواست **واقعی برنامه مقصد** بفرستید؛ اگر مقصد HTTP است:
-
-```bash
-curl --max-time 20 http://IRAN_SERVER_IP:18080/
-```
-
-برای TLS یا پروتکل دیگر client همان برنامه را استفاده کنید. فایل قابل مقایسه را در هر دو جهت و انتقال طولانی آزمایش کنید. در Logs پنل پیام اتصال/احراز هویت و در Tunnels وضعیت عامل را ببینید. `sudo bash install-hesar.sh --logs` فقط journal دو سرویس را می‌خواند و تنظیم دستی پروتکل نیست.
-
-برای مقایسه مسیر، زمان تهران، ASN، پروفایل، نسبت اتصال موفق، latency، hash/حجم فایل، سرعت رفت/برگشت و قطع‌ها را ثبت کنید. تست‌های مخزن آزمایشگاهی‌اند؛ ادعای سرعت یا عبور امروز ایران نیستند.
-
-## ساختار و نام فایل‌ها
+## معماری و ساختار مخزن
 
 ```text
-.github/workflows/ci.yml           بررسی PR و artifact آزمایشی
-.github/workflows/build.yml        بیلد و امضای Release از tag
-backend/cmd/hesar/                 پنل HTTP و انتقال احرازشده
-backend/cmd/hesar-agent/           عامل محلی Linux
-backend/internal/provision/       IPC محدود، کانفیگ هسته و مدیریت L3
-backend/internal/config/          اعتبارسنجی و ذخیره تنظیمات
-backend/internal/tunnel/          transportها و lifecycle
-frontend/                        پنل React
-scripts/install-hesar.sh           نصب بسته کامل
-scripts/fetch-release-cores.py     دریافت هسته pin شده و بررسی checksum
-scripts/build-linux-release.sh    مرحله بیلد workflow
-scripts/package-linux-release.py  ساخت آرشیو و manifest
-scripts/test-release-installer.sh  آزمون رد بسته خراب و حفظ نصب قبلی
-scripts/test-linux-layer3.py       آزمون لینک کرنل و محدودیت مسیر
-scripts/test-managed-transports.py آزمون API و هسته‌های واقعی
-docs/architecture.md              مرز دسترسی عامل شبکه
-docs/iran-dpi-research.fa.md            شواهد و منابع تحقیق
+backend/cmd/hesar/                      باینری پنل وب و موتور تانل HESAR
+backend/cmd/hesar-agent/                ایجنت محلی شبکه با سطح دسترسی root و سوکت یونیکس
+backend/internal/api/                   سرور HTTP، احراز هویت، مدیریت تانل‌ها و خروجی Peer Setup
+backend/internal/config/                اعتبارسنجی کانفیگ، پروفایل‌های شبکه و مهاجرت نسخه‌ها
+backend/internal/provision/             مدیریت GRE/IPIP، فایروال، هسته‌های Paqet/Xray/Hysteria و BBR
+backend/internal/tunnel/                ترنسپورت‌های TCP، KCP، QUIC، WSS، Shaped-WSS و Auto
+frontend/                               پنل مدیریت وب (React + TypeScript + Tailwind CSS)
+scripts/build-linux-release.sh          بیلد کامل فرانت‌اند، بک‌اند و بسته‌بندی انتشار لینوکس
+scripts/fetch-release-cores.py          دریافت و بررسی SHA-256 هسته‌های رسمی انتشار
+scripts/package-linux-release.py        تولید آرشیوهای نهایی hesar-linux-amd64/arm64.tar.gz
+scripts/install-hesar.sh                نصب‌کننده خودکار و آفلاین بسته کامل انتشار
+scripts/hesar.sh                        منوی تعاملی نصب و مدیریت سرور
+docs/architecture.md                    مستندات معماری فنی و جریان داده
 ```
 
-پنل با UID `hesar` اجرا می‌شود. سرویس `hesar-agent` فقط عملیات مشخص را از Unix socket محلی با بررسی UID می‌پذیرد؛ حداکثر ۱۶ تونل تحت مدیریت عامل هم‌زمان مجاز است.  پنل نمی‌تواند shell، مسیر باینری دلخواه یا کانفیگ خام هسته ارسال کند. نسخه، checksum، مجوز و لینک سورس هسته‌ها در `CORE-VERSIONS.json` بسته ثبت می‌شوند.
+---
 
-پروژه تحت [LICENSE](LICENSE) است. مجوز هسته‌های همراه داخل `licenses` هر Release قرار دارد. معماری دقیق در [architecture.md](docs/architecture.md) توضیح داده شده است.
+## بیلد دستی از سورس (توسعه‌دهندگان)
+
+برای ساخت بسته کامل انتشار لینوکس (`amd64` و `arm64`):
+
+```bash
+bash scripts/build-linux-release.sh v2.1.0
+```
+
+خروجی‌های نهایی در پوشه `release/` ساخته می‌شوند (`hesar-linux-amd64.tar.gz`، `hesar-linux-arm64.tar.gz`، `install-hesar.sh` و `checksums-sha256.txt`).

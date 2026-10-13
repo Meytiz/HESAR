@@ -1,43 +1,40 @@
-# Binaries and build outputs
-backend/hesar
-backend/hesar.exe
-backend/__debug_bin
-frontend/dist/
-release/
-frontend/pnpm-lock.yaml
-private-pair/
-credentials.json
-bridge.json
-overseas.json
-*-layer3.json
-__pycache__/
-*.pyc
-node_modules/
-*.o
-*.so
+# Binaries & build outputs
+hesar
+hesar-agent
+hesar-linux-*
+hesar-agent-linux-*
 *.exe
 *.dll
+*.so
+*.dylib
+release/
+.tmp-build/
+/tmp/
 
-# backend/internal/api/dist is the copy of the built SPA that server.go
-# embeds (`//go:embed all:dist`). The directory and a tracked placeholder MUST
-# exist, otherwise every Go tool on a fresh checkout dies with
-# "pattern all:dist: no matching files found" — only the real build output
-# staged there by GitHub Actions is ignored.
+# Test binary, built with `go test -c`
+*.test
+*.out
+coverage.txt
+__pycache__/
+*.py[cod]
+
+# Dependencies & frontend build artifacts
+node_modules/
+frontend/node_modules/
+frontend/dist/
 backend/internal/api/dist/*
 !backend/internal/api/dist/.gitkeep
 
-# OS files
-.DS_Store
-Thumbs.db
-
-# Config and local database storage
+# Local runtime state & logs
 data/
-config.json
-hesar.log
 *.log
+*.db
+config.json
 
-# Editor directories and files
+# Environment & IDE files
+.env
+.env.*
 .vscode/
 .idea/
-*.swp
-*.swo
+.DS_Store
+Thumbs.db

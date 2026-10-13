@@ -197,7 +197,7 @@ func validateTunnel(t *TunnelConfig) error {
 	case "tls", "sni_spoof", "ip_spoof":
 		return fmt.Errorf("protocol %q has been REMOVED in HESAR vNext; recreate this tunnel with 'quic' (recommended), 'tcp' or 'kcp'", t.Protocol)
 	default:
-		return fmt.Errorf("invalid protocol %q: must be one of tcp, kcp, quic, wss, auto", t.Protocol)
+		return fmt.Errorf("invalid protocol %q: must be one of tcp, kcp, quic, wss, wss-shaped, auto", t.Protocol)
 	}
 	// Status is persisted and drives auto-start, so a bogus value must not be
 	// accepted (it would leave the tunnel permanently unreachable from the
