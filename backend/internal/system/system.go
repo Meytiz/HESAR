@@ -1,7 +1,6 @@
 package system
 
 import (
-	"fmt"
 	"os/exec"
 	"strings"
 	"sync"
@@ -91,57 +90,4 @@ func GetSystemMetrics() SystemInfo {
 
 func CheckBBR() bool {
 	return getCachedBBR()
-}
-
-func EnableBBR() error {
-	commands := [][]string{
-		{"sysctl", "-w", "net.core.default_qdisc=fq"},
-		{"sysctl", "-w", "net.ipv4.tcp_congestion_control=bbr"},
-	}
-	var firstErr error
-	for _, c := range commands {
-		cmd := exec.Command(c[0], c[1:]...)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			msg := fmt.Sprintf("failed to run %v: %s", c, strings.TrimSpace(string(out)))
-			if firstErr == nil {
-				firstErr = fmt.Errorf("%s", msg)
-			}
-		}
-	}
-	bbrCacheMu.Lock()
-	bbrCacheTime = time.Time{}
-	bbrCacheMu.Unlock()
-	return firstErr
-}
-
-func OptimizeNetwork() error {
-	sysctls := map[string]string{
-		"fs.file-max":                  "1048576",
-		"net.ipv4.tcp_tw_reuse":        "1",
-		"net.ipv4.tcp_fin_timeout":     "15",
-		"net.ipv4.ip_local_port_range": "1024 65535",
-		"net.core.somaxconn":           "65535",
-		"net.ipv4.tcp_max_syn_backlog": "65535",
-		"net.core.netdev_max_backlog":  "65535",
-		"net.ipv4.tcp_rmem":            "4096 87380 67108864",
-		"net.ipv4.tcp_wmem":            "4096 65536 67108864",
-	}
-	var firstErr error
-	successCount := 0
-	for k, v := range sysctls {
-		cmd := exec.Command("sysctl", "-w", fmt.Sprintf("%s=%s", k, v))
-		if out, err := cmd.CombinedOutput(); err != nil {
-			LogWarn("Failed to optimize %s: %s", k, strings.TrimSpace(string(out)))
-			if firstErr == nil {
-				firstErr = fmt.Errorf("failed to optimize %s", k)
-			}
-		} else {
-			successCount++
-		}
-	}
-	LogInfo("Network optimization: %d/%d succeeded", successCount, len(sysctls))
-	if successCount == 0 && firstErr != nil {
-		return firstErr
-	}
-	return nil
 }

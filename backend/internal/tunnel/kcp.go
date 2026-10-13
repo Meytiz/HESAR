@@ -28,7 +28,7 @@ type KCPHandler struct {
 
 func NewKCPHandler(cfg *config.TunnelConfig) *KCPHandler {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &KCPHandler{cfg: cfg, ctx: ctx, cancel: cancel, pool: NewConnPool(DefaultMaxConcurrentHandshakes)}
+	return &KCPHandler{cfg: cfg, ctx: ctx, cancel: cancel, pool: NewConnPool(0)}
 }
 
 func applyKCPOptions(sess *kcp.UDPSession, mode string) {
@@ -51,6 +51,9 @@ func applyKCPOptions(sess *kcp.UDPSession, mode string) {
 }
 
 func (h *KCPHandler) Start() error {
+	if _, err := underlayAddress(h.ctx, h.cfg); err != nil {
+		return err
+	}
 	// psk authenticates the ephemeral X25519 handshake performed inside
 	// crypto.NewSecureConn (see crypto.go) — it is never used directly as
 	// a symmetric encryption key. Session keys are derived from a fresh
@@ -63,7 +66,7 @@ func (h *KCPHandler) Start() error {
 		}
 		h.mu.Lock()
 		for _, port := range ports {
-			l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+			l, err := net.Listen("tcp", listenAddr(h.cfg, port))
 			if err != nil {
 				h.mu.Unlock()
 				h.Stop()
@@ -76,7 +79,7 @@ func (h *KCPHandler) Start() error {
 		system.LogInfo("KCP Iran tunnel [%s] (mode: %s) started on ports: %s", h.cfg.Name, h.cfg.KCPMode, h.cfg.LocalPorts)
 	} else if h.cfg.Mode == "overseas" {
 		block, _ := kcp.NewNoneBlockCrypt(nil)
-		l, err := kcp.ListenWithOptions(fmt.Sprintf(":%d", h.cfg.RemotePort), block, 10, 3)
+		l, err := kcp.ListenWithOptions(listenAddr(h.cfg, h.cfg.RemotePort), block, 10, 3)
 		if err != nil {
 			return fmt.Errorf("KCP overseas listen port %d: %w", h.cfg.RemotePort, err)
 		}
@@ -93,6 +96,7 @@ func (h *KCPHandler) Start() error {
 
 func (h *KCPHandler) Stop() {
 	h.cancel()
+	h.pool.CloseAll()
 	h.mu.Lock()
 	for _, l := range h.listeners {
 		_ = l.Close()
@@ -115,7 +119,7 @@ func (h *KCPHandler) runIranListener(l net.Listener, psk []byte) {
 				continue
 			}
 		}
-		go func(c net.Conn) {
+		h.pool.Run(clientConn, func(c net.Conn) {
 			defer c.Close()
 
 			if err := h.pool.Acquire(h.ctx); err != nil {
@@ -130,23 +134,44 @@ func (h *KCPHandler) runIranListener(l net.Listener, psk []byte) {
 			}
 			defer release()
 
-			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+			_ = c.SetDeadline(time.Now().Add(dialTimeout(h.cfg)))
 			remoteAddr := net.JoinHostPort(h.cfg.RemoteIP, strconv.Itoa(h.cfg.RemotePort))
 			block, _ := kcp.NewNoneBlockCrypt(nil)
-			kcpConn, err := kcp.DialWithOptions(remoteAddr, block, 10, 3)
+			var kcpConn *kcp.UDPSession
+			var packetConn *net.UDPConn
+			source, err := underlayAddress(h.ctx, h.cfg)
+			if err == nil && source == nil {
+				kcpConn, err = kcp.DialWithOptions(remoteAddr, block, 10, 3)
+			} else if err == nil {
+				packetConn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: source})
+				if err == nil {
+					defer packetConn.Close()
+					peer := &net.UDPAddr{IP: net.ParseIP(h.cfg.RemoteIP).To4(), Port: h.cfg.RemotePort}
+					kcpConn, err = kcp.NewConn2(peer, block, 10, 3, packetConn)
+				}
+			}
 			if err != nil {
 				system.LogError("KCP Iran connect to [%s]: %v", remoteAddr, err)
 				return
 			}
 			defer kcpConn.Close()
+			stopClose := context.AfterFunc(h.ctx, func() { _ = kcpConn.Close() })
+			defer stopClose()
 			applyKCPOptions(kcpConn, h.cfg.KCPMode)
+			if h.cfg.UnderlayInterface != "" {
+				iface, err := net.InterfaceByName(h.cfg.UnderlayInterface)
+				if err != nil {
+					return
+				}
+				kcpConn.SetMtu(min(1200, iface.MTU-28))
+			}
 
 			// The X25519 handshake performs a full read/write round-trip
 			// on kcpConn. Without an explicit deadline here, an
 			// unresponsive or malicious overseas peer could stall this
 			// goroutine indefinitely, leaking the KCP session, its
 			// underlying UDP resources, and its pool slot.
-			_ = kcpConn.SetDeadline(time.Now().Add(10 * time.Second))
+			_ = kcpConn.SetDeadline(time.Now().Add(dialTimeout(h.cfg)))
 			secureConn, err := crypto.NewSecureConn(kcpConn, psk, true)
 			if err != nil {
 				system.LogError("KCP Iran secure handshake: %v", err)
@@ -158,12 +183,12 @@ func (h *KCPHandler) runIranListener(l net.Listener, psk []byte) {
 			release()
 
 			_ = c.SetDeadline(time.Time{})
-			ProxyBidirectional(c, secureConn, func(in, out int64) {
+			proxyWithTimeout(h.ctx, c, secureConn, func(in, out int64) {
 				if config.GlobalConfig != nil {
 					_ = config.GlobalConfig.UpdateTunnelStats(h.cfg.ID, in, out)
 				}
-			})
-		}(clientConn)
+			}, idleTimeout(h.cfg))
+		})
 	}
 }
 
@@ -183,8 +208,16 @@ func (h *KCPHandler) runOverseasListener(l net.Listener, psk []byte) {
 		kcpSess, ok := incomingConn.(*kcp.UDPSession)
 		if ok {
 			applyKCPOptions(kcpSess, h.cfg.KCPMode)
+			if h.cfg.UnderlayInterface != "" {
+				iface, err := net.InterfaceByName(h.cfg.UnderlayInterface)
+				if err != nil {
+					_ = incomingConn.Close()
+					continue
+				}
+				kcpSess.SetMtu(min(1200, iface.MTU-28))
+			}
 		}
-		go func(c net.Conn) {
+		h.pool.Run(incomingConn, func(c net.Conn) {
 			defer c.Close()
 
 			if err := h.pool.Acquire(h.ctx); err != nil {
@@ -201,15 +234,16 @@ func (h *KCPHandler) runOverseasListener(l net.Listener, psk []byte) {
 
 			// Deadline set before the handshake (read msg1, write msg2)
 			// is performed directly on c — already correct.
-			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+			_ = c.SetDeadline(time.Now().Add(dialTimeout(h.cfg)))
 			secureConn, err := crypto.NewSecureConn(c, psk, false)
 			if err != nil {
 				system.LogError("KCP Overseas secure handshake: %v", err)
 				return
 			}
 			defer secureConn.Close()
-			targetAddr := fmt.Sprintf("127.0.0.1:%d", h.cfg.TargetPort)
-			targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+			targetAddr := targetAddr(h.cfg)
+			dialer := &net.Dialer{Timeout: dialTimeout(h.cfg)}
+			targetConn, err := dialer.DialContext(h.ctx, "tcp", targetAddr)
 			if err != nil {
 				system.LogError("KCP Overseas connect to [%s]: %v", targetAddr, err)
 				return
@@ -219,11 +253,11 @@ func (h *KCPHandler) runOverseasListener(l net.Listener, psk []byte) {
 			release()
 
 			_ = c.SetDeadline(time.Time{})
-			ProxyBidirectional(secureConn, targetConn, func(in, out int64) {
+			proxyWithTimeout(h.ctx, secureConn, targetConn, func(in, out int64) {
 				if config.GlobalConfig != nil {
 					_ = config.GlobalConfig.UpdateTunnelStats(h.cfg.ID, in, out)
 				}
-			})
-		}(incomingConn)
+			}, idleTimeout(h.cfg))
+		})
 	}
 }

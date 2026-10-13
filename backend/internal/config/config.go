@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -28,7 +29,7 @@ type TunnelConfig struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
 	Mode          string `json:"mode"`        // "iran" or "overseas"
-	Protocol      string `json:"protocol"`    // "quic", "tcp", "kcp"
+	Protocol      string `json:"protocol"`    // "quic", "tcp", "kcp", "wss", "auto"
 	Status        string `json:"status"`      // "active" or "inactive"
 	LocalPorts    string `json:"local_ports"` // e.g. "80", "80,880", "80-100"
 	RemoteIP      string `json:"remote_ip"`
@@ -38,12 +39,44 @@ type TunnelConfig struct {
 
 	KCPMode string `json:"kcp_mode,omitempty"`
 
-	// QUICEnableUDP opts this tunnel into the experimental QUIC DATAGRAM
-	// UDP relay (also requires HESAR_ENABLE_QUIC_DATAGRAM=1 on the daemon).
+	// QUICEnableUDP is retained for explicit migration errors. Application
+	// UDP relay is disabled; only TCP application forwarding is supported.
 	// NOTE: the legacy "spoof_sni"/"fake_ip" fields of pre-vNext configs
 	// are silently ignored on load — SNI spoofing and the cosmetic IP
 	// "spoofing" have both been REMOVED entirely (see the release notes).
-	QUICEnableUDP bool `json:"quic_enable_udp,omitempty"`
+	QUICEnableUDP           bool   `json:"quic_enable_udp,omitempty"`
+	NetworkProfile          string `json:"network_profile,omitempty"`
+	ListenAddress           string `json:"listen_address,omitempty"`
+	UnderlayInterface       string `json:"underlay_interface,omitempty"`
+	Carrier                 string `json:"carrier,omitempty"`
+	CarrierPeerIP           string `json:"carrier_peer_ip,omitempty"`
+	CarrierLocalIP          string `json:"carrier_local_ip,omitempty"`
+	CarrierLocalInner       string `json:"carrier_local_inner,omitempty"`
+	CarrierRemoteInner      string `json:"carrier_remote_inner,omitempty"`
+	CarrierMTU              int    `json:"carrier_mtu,omitempty"`
+	CarrierPort             int    `json:"carrier_port,omitempty"`
+	CarrierAuth             string `json:"carrier_auth,omitempty"`
+	CarrierObfs             string `json:"carrier_obfs,omitempty"`
+	RealityPrivateKey       string `json:"reality_private_key,omitempty"`
+	RealityPublicKey        string `json:"reality_public_key,omitempty"`
+	RealityShortID          string `json:"reality_short_id,omitempty"`
+	RealityTarget           string `json:"reality_target,omitempty"`
+	TLSCertPEM              string `json:"tls_cert_pem,omitempty"`
+	TLSKeyPEM               string `json:"tls_key_pem,omitempty"`
+	TLSCAPEM                string `json:"tls_ca_pem,omitempty"`
+	TargetHost              string `json:"target_host,omitempty"`
+	ServerName              string `json:"server_name,omitempty"`
+	TLSCertFile             string `json:"tls_cert_file,omitempty"`
+	TLSKeyFile              string `json:"tls_key_file,omitempty"`
+	TLSCAFile               string `json:"tls_ca_file,omitempty"`
+	WSPath                  string `json:"ws_path,omitempty"`
+	ProxyURL                string `json:"proxy_url,omitempty"`
+	TLSFragmentSize         int    `json:"tls_fragment_size,omitempty"`
+	TLSFragmentDelayMS      int    `json:"tls_fragment_delay_ms,omitempty"`
+	DialTimeoutSeconds      int    `json:"dial_timeout_seconds,omitempty"`
+	IdleTimeoutSeconds      int    `json:"idle_timeout_seconds,omitempty"`
+	FallbackCooldownSeconds int    `json:"fallback_cooldown_seconds,omitempty"`
+	QUICDisablePMTU         bool   `json:"quic_disable_pmtu,omitempty"`
 
 	BytesIn  int64 `json:"bytes_in"`
 	BytesOut int64 `json:"bytes_out"`
@@ -160,11 +193,11 @@ func validateTunnel(t *TunnelConfig) error {
 		return fmt.Errorf("invalid mode %q: must be 'iran' or 'overseas'", t.Mode)
 	}
 	switch t.Protocol {
-	case "tcp", "kcp", "quic":
+	case "tcp", "kcp", "quic", "wss", "wss-shaped", "auto":
 	case "tls", "sni_spoof", "ip_spoof":
 		return fmt.Errorf("protocol %q has been REMOVED in HESAR vNext; recreate this tunnel with 'quic' (recommended), 'tcp' or 'kcp'", t.Protocol)
 	default:
-		return fmt.Errorf("invalid protocol %q: must be one of tcp, kcp, quic", t.Protocol)
+		return fmt.Errorf("invalid protocol %q: must be one of tcp, kcp, quic, wss, auto", t.Protocol)
 	}
 	// Status is persisted and drives auto-start, so a bogus value must not be
 	// accepted (it would leave the tunnel permanently unreachable from the
@@ -206,8 +239,12 @@ func validateTunnel(t *TunnelConfig) error {
 			return fmt.Errorf("invalid kcp_mode %q: must be normal, fast, fast2, or fast3", t.KCPMode)
 		}
 	}
-	return nil
+	return validateNetworkOptions(t)
 }
+
+// ValidateTunnel is also used before binding listeners, including configs
+// loaded from disk rather than created through the panel.
+func ValidateTunnel(t *TunnelConfig) error { return validateTunnel(t) }
 
 // ──────────────────────────────────────────────────
 // Init
@@ -272,6 +309,22 @@ func (m *Manager) Load() error {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return err
 	}
+	if cfg.AdminUsername == "" || len(cfg.AdminUsername) > 128 || len(cfg.AdminPassword) < 8 || len(cfg.AdminPassword) > 1024 || len(cfg.SecretKey) < 32 {
+		return errors.New("config requires an admin username, password of at least 8 characters, and secret_key of at least 32 characters")
+	}
+	if cfg.ListenPort < 1 || cfg.ListenPort > 65535 {
+		return errors.New("config listen_port must be 1-65535")
+	}
+	seen := make(map[string]bool)
+	for _, t := range cfg.Tunnels {
+		if t == nil || t.ID == "" {
+			return errors.New("config contains a null tunnel or missing tunnel ID")
+		}
+		if seen[t.ID] {
+			return errors.New("config contains duplicate tunnel IDs")
+		}
+		seen[t.ID] = true
+	}
 
 	if cfg.Tunnels == nil {
 		cfg.Tunnels = []*TunnelConfig{}
@@ -295,8 +348,29 @@ func (m *Manager) saveLocked() error {
 		return err
 	}
 
-	tmpPath := m.configPath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+	f, err := os.CreateTemp(dir, ".hesar-config-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := f.Name()
+	defer os.Remove(tmpPath)
+	if err := f.Chmod(0600); err != nil {
+		f.Close()
+		return err
+	}
+	n, err := f.Write(data)
+	if err != nil || n != len(data) {
+		f.Close()
+		if err != nil {
+			return err
+		}
+		return io.ErrShortWrite
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmpPath, m.configPath)
@@ -356,6 +430,7 @@ func (m *Manager) cloneAllowedOrigins() []string {
 func (m *Manager) SetAllowedOrigins(origins []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	before := m.snapshotLocked()
 
 	clean := make([]string, 0, len(origins))
 	for _, o := range origins {
@@ -364,7 +439,7 @@ func (m *Manager) SetAllowedOrigins(origins []string) error {
 		}
 	}
 	m.config.AllowedOrigins = clean
-	return m.saveLocked()
+	return m.persistLocked(before)
 }
 
 func (m *Manager) cloneTunnels() []*TunnelConfig {
@@ -400,8 +475,27 @@ func (m *Manager) GetTunnel(id string) (*TunnelConfig, error) {
 // ──────────────────────────────────────────────────
 
 func (m *Manager) UpdateSettings(username, password string, logPath string, logMaxSizeMB int) error {
+	return m.UpdatePanelSettings(username, password, logPath, logMaxSizeMB, nil)
+}
+
+func (m *Manager) UpdatePanelSettings(username, password string, logPath string, logMaxSizeMB int, origins []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	before := m.snapshotLocked()
+	if len(username) > 128 || len(password) > 1024 || password != "" && len(password) < 8 {
+		return errors.New("invalid admin credentials: password must be at least 8 characters")
+	}
+	if logMaxSizeMB < 0 || logMaxSizeMB > 1024 {
+		return errors.New("log_max_size_mb must be 0-1024")
+	}
+	credentialsChanged := username != "" && username != m.config.AdminUsername || password != "" && password != m.config.AdminPassword
+	if credentialsChanged {
+		key, err := generateRandomHex(32)
+		if err != nil {
+			return err
+		}
+		m.config.SecretKey = key
+	}
 
 	if username != "" {
 		m.config.AdminUsername = username
@@ -415,13 +509,23 @@ func (m *Manager) UpdateSettings(username, password string, logPath string, logM
 	if logMaxSizeMB > 0 {
 		m.config.LogMaxSizeMB = logMaxSizeMB
 	}
+	if origins != nil {
+		m.config.AllowedOrigins = append([]string{}, origins...)
+	}
 
-	return m.saveLocked()
+	return m.persistLocked(before)
+}
+
+func (m *Manager) GetSecretKey() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.config.SecretKey
 }
 
 func (m *Manager) AddTunnel(t *TunnelConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	before := m.snapshotLocked()
 
 	if err := ensureEncryptionKey(t); err != nil {
 		return err
@@ -440,8 +544,9 @@ func (m *Manager) AddTunnel(t *TunnelConfig) error {
 	if t.Status == "" {
 		t.Status = "inactive"
 	}
-	m.config.Tunnels = append(m.config.Tunnels, t)
-	return m.saveLocked()
+	copyTunnel := *t
+	m.config.Tunnels = append(m.config.Tunnels, &copyTunnel)
+	return m.persistLocked(before)
 }
 
 // UpdateTunnel replaces a stored tunnel with t. An empty EncryptionKey
@@ -452,6 +557,7 @@ func (m *Manager) AddTunnel(t *TunnelConfig) error {
 func (m *Manager) UpdateTunnel(t *TunnelConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	before := m.snapshotLocked()
 
 	for i, existing := range m.config.Tunnels {
 		if existing.ID != t.ID {
@@ -475,8 +581,9 @@ func (m *Manager) UpdateTunnel(t *TunnelConfig) error {
 		t.BytesIn = existing.BytesIn
 		t.BytesOut = existing.BytesOut
 		t.Uptime = existing.Uptime
-		m.config.Tunnels[i] = t
-		return m.saveLocked()
+		copyTunnel := *t
+		m.config.Tunnels[i] = &copyTunnel
+		return m.persistLocked(before)
 	}
 	return ErrTunnelNotFound
 }
@@ -484,6 +591,7 @@ func (m *Manager) UpdateTunnel(t *TunnelConfig) error {
 func (m *Manager) UpdateTunnelStatus(id string, status string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	before := m.snapshotLocked()
 
 	for _, t := range m.config.Tunnels {
 		if t.ID == id {
@@ -493,7 +601,7 @@ func (m *Manager) UpdateTunnelStatus(id string, status string) error {
 			} else {
 				t.Uptime = 0
 			}
-			return m.saveLocked()
+			return m.persistLocked(before)
 		}
 	}
 	return ErrTunnelNotFound
@@ -520,24 +628,40 @@ func (m *Manager) UpdateTunnelStats(id string, bytesIn, bytesOut int64) error {
 func (m *Manager) RotateSecretKey() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	before := m.snapshotLocked()
 
 	key, err := generateRandomHex(32)
 	if err != nil {
 		return fmt.Errorf("failed to rotate secret_key: %w", err)
 	}
 	m.config.SecretKey = key
-	return m.saveLocked()
+	return m.persistLocked(before)
 }
 
 func (m *Manager) DeleteTunnel(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	before := m.snapshotLocked()
 
 	for i, existing := range m.config.Tunnels {
 		if existing.ID == id {
 			m.config.Tunnels = append(m.config.Tunnels[:i], m.config.Tunnels[i+1:]...)
-			return m.saveLocked()
+			return m.persistLocked(before)
 		}
 	}
 	return ErrTunnelNotFound
+}
+
+func (m *Manager) snapshotLocked() *AppConfig {
+	c := *m.config
+	c.Tunnels = m.cloneTunnels()
+	c.AllowedOrigins = m.cloneAllowedOrigins()
+	return &c
+}
+func (m *Manager) persistLocked(before *AppConfig) error {
+	if err := m.saveLocked(); err != nil {
+		m.config = before
+		return err
+	}
+	return nil
 }

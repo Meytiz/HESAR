@@ -1,450 +1,162 @@
-﻿<div align="center">
+# HESAR
 
-# 🏰 HESAR
+انتقال ترافیک **TCP** بین سرور ایران و خارج با پنل **HTTP** و تنظیم پروتکل‌ها از داخل پنل. بسته Linux شامل HESAR، عامل محلی مدیریت شبکه و هسته‌های Paqet، Xray و Hysteria است. سرورها به Go، Node، بیلد سورس، ویرایش کانفیگ هسته یا اجرای دستی دستور GRE نیاز ندارند.
 
-### A Modern Reverse-Tunnel Platform for Bypassing Filtering & DPI
+هیچ پروتکلی عبور قطعی از DPI، allowlist، قطع اینترنت یا محدودیت IP را تضمین نمی‌کند. نتیجه یک مسیر یا یک جهت GRE را نمی‌توان به همه ایران تعمیم داد. [منابع و روش تحقیق](docs/iran-dpi-research.fa.md).
 
-<p>
-  <img src="https://img.shields.io/github/stars/Meytiz/HESAR?style=for-the-badge&color=gold" alt="stars">
-  <img src="https://img.shields.io/github/forks/Meytiz/HESAR?style=for-the-badge&color=blue" alt="forks">
-  <img src="https://img.shields.io/github/watchers/Meytiz/HESAR?style=for-the-badge&color=green" alt="watchers">
-  <img src="https://img.shields.io/github/license/Meytiz/HESAR?style=for-the-badge&color=orange" alt="license">
-</p>
+## مسیرهای قابل انتخاب
 
-<p>
-  <img src="https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go">
-  <img src="https://img.shields.io/badge/React-18-61DAFB?style=flat-square&logo=react&logoColor=black" alt="React">
-  <img src="https://img.shields.io/badge/TypeScript-Vite-3178C6?style=flat-square&logo=typescript&logoColor=white" alt="TypeScript">
-  <img src="https://img.shields.io/badge/TailwindCSS-latest-38B2AC?style=flat-square&logo=tailwind-css&logoColor=white" alt="TailwindCSS">
-  <img src="https://img.shields.io/badge/Platform-Linux%20amd64%2Farm64-lightgrey?style=flat-square&logo=linux&logoColor=black" alt="Platform">
-</p>
+| پروفایل | حمل ترافیک | تنظیم با Start از پنل |
+|---|---|---|
+| Auto | QUIC → WSS در شکست راه‌اندازی | انتخاب پیش از ارسال داده و cooldown |
+| WSS / TLS fragmentation | TLS 1.3 و WebSocket | گواهی PEM، CA و قطعه‌بندی اختیاری |
+| Shaped WSS، آزمایشی | WSS با padding محدود | تغییر طول برخی ارسال‌ها با هزینه پهنای باند |
+| QUIC / TCP / KCP | transport داخلی احرازشده | listener و اتصال به مقصد |
+| GRE / IPIP | لایه ۳ همراه TCP، QUIC یا KCP | لینک، IP خصوصی، MTU و policy route محدود |
+| Paqet | TCP خام، KCP و SOCKS5 داخلی | تشخیص کارت/IP/MAC، قواعد محدود و اجرای هسته |
+| REALITY/XHTTP | Xray: VLESS + XHTTP + REALITY | کلیدها، کانفیگ هسته و SOCKS5 خصوصی |
+| Hysteria 2 | QUIC + Salamander | گواهی، CA، کلید مستقل obfs و هسته |
 
-**HESAR** (meaning *"Fortress"* in Persian) is a modern reverse-tunnel platform specifically engineered for networks with heavy filtering and environments subject to Deep Packet Inspection (DPI).
+GRE/IPIP به‌تنهایی رمزنگاری ندارند؛ HESAR روی آن‌ها احراز هویت و رمزنگاری می‌کند. QUIC داخلی ALPN اختصاصی دارد و HTTP/3 نیست. ترافیک UDP برنامه‌ها در این نسخه پشتیبانی نمی‌شود. Auto اتصال فعال را بین مسیرها جابه‌جا یا داده را دوباره ارسال نمی‌کند.
 
-[Quick Install](#-quick-installation) •
-[Features](#-features) •
-[Architecture](#️-architecture) •
-[Configuration](#️-configuration) •
-[Security](#-security) •
-[Contributing](#-contributing)
+## بیلد و انتشار، فقط در GitHub
 
-</div>
-
----
-
-## 📑 Table of Contents
-
-- [Overview](#-overview)
-- [Features](#-features)
-  - [Tunnel Protocols](#️-tunnel-protocols)
-  - [Encryption](#-encryption)
-  - [Web Management Panel](#️-web-management-panel)
-  - [CLI Installer](#️-cli-installer)
-- [Architecture](#️-architecture)
-- [Quick Installation](#-quick-installation)
-- [Offline Installation](#-offline-installation)
-- [Build From Source](#-build-from-source)
-- [Configuration](#️-configuration)
-- [Security](#-security)
-- [Server Optimization](#-server-optimization)
-- [Project Structure](#-project-structure)
-- [Troubleshooting](#-troubleshooting)
-- [Roadmap](#️-roadmap)
-- [Contributing](#-contributing)
-- [License](#-license)
-
----
-
-## 🌟 Overview
-
-**HESAR** is a lightweight, secure, and powerful tunneling solution that lets you route network traffic from a server inside a restricted network (e.g. behind a national firewall) to a server on the open internet — without DPI systems being able to detect or block it.
-
-The project is a combination of:
-
-| Layer | Technology |
-|---|---|
-| 🐹 **Backend** | Go — a single, lightweight, self-contained binary |
-| ⚛️ **Frontend (Web Panel)** | React + TypeScript + Vite + Tailwind CSS |
-
-Shipped as a **single self-contained binary**, it provides:
-
-| Capability | Description |
-|---|---|
-| 🔐 Encrypted tunnels | With AEAD framing and length-prefixed chunks |
-| 🚀 QUIC-first transports         | QUIC streams over one multiplexed TLS 1.3 connection; if UDP is filtered, switch the tunnel to TCP/KCP manually |
-| 📊 Real-time dashboard | CPU/RAM, load, BBR, uptime |
-| ⚙️ Auto-install & network tuning | One command, systemd service, BBR |
-
----
-
-## ✨ Features
-
-### 🛡️ Tunnel Protocols
-
-| Protocol | Description |
-|---|---|
-| **QUIC** | Primary transport. TCP connections become QUIC streams multiplexed over one TLS 1.3 connection; optional experimental UDP relay via QUIC DATAGRAM (RFC 9221). If UDP/QUIC is filtered, switch the tunnel protocol to TCP or KCP manually (no fallback transport) |
-| **TCP** | Legacy encrypted TCP transport with AEAD framing (kept for compatibility) |
-| **KCP** | Legacy low-latency, reliable UDP tunnel (experimental) |
-
-> **Removed in vNext:** SNI Spoofing and IP-Header "spoofing" were removed
-> entirely. The IP feature never changed the real source IP (it only
-> encapsulated a crafted header inside the encrypted TCP payload) and the
-> SNI probe produced false positives; both are replaced by the QUIC/TLS
-> transport stack above.
-
-### 🔒 Encryption
-
-HESAR uses modern cryptographic standards with **per-session key isolation**:
-
-| Component | Purpose |
-|---|---|
-| **X25519** | Secure elliptic-curve key exchange |
-| **ChaCha20-Poly1305** | Fast and secure AEAD encryption |
-| **HKDF** | HMAC-based key derivation for session separation |
-| **Random Salt** | 32-byte random salt per connection to reduce fingerprinting |
-
-### 🎛️ Web Management Panel
-
-The web panel is built with **React 18 + TypeScript + Vite + Tailwind CSS**:
-
-| Feature | Description |
-|---|---|
-| **Dashboard** | Real-time tunnel status, CPU/RAM usage, load, BBR and uptime |
-| **Tunnel Manager** | Create, edit, start, stop and delete tunnels |
-| **Live Logs** | Live log streaming via WebSocket |
-| **Protocol Tester** | Real TCP / TLS / QUIC reachability probes with SSRF protection |
-| **Settings** | Manage username, password, log path and rotation size |
-| **Key Generator** | Generate X25519 key pairs and tunnel cipher keys |
-| **Responsive** | Responsive design for mobile and desktop |
-
-### 🖥️ CLI Installer
-
-The `scripts/hesar.sh` script provides the following commands:
-
-| Command | Description |
-|---|---|
-| `--quickstart` | Auto-install with secure random configuration |
-| `--core` | Install service as a daemon only |
-| `--optimize` | Enable TCP BBR and kernel network tuning |
-| `--uninstall` | Completely remove HESAR and related files |
-| `--status` | Show systemd service status |
-| `--logs` | Show latest logs |
-
----
-
-## 🏗️ Architecture
-
-```
-┌────────────────────────────────┐    ┌────────────────────────────────┐
-│                                │    │                                │
-│        🇮🇷 BRIDGE SERVER       │    │        🌐 NODE SERVER          │
-│    (Restricted Network)        │    │      (Open Internet)           │
-│                                │    │                                │
-│  ┌────────────────────────┐    │    │    ┌────────────────────────┐  │
-│  │ Local Ports            │    │    │    │ Target Forward         │  │
-│  │ :80, :443              │────┼────┼───▶│ :8080, :1080           │  │
-│  └────────────────────────┘    │    │    └────────────────────────┘  │
-│                                │    │                                │
-│  ┌────────────────────────┐    │    │    ┌────────────────────────┐  │
-│  │ HESAR Management Panel │    │    │    │ HESAR Management Panel │  │
-│  │ :5123                  │    │    │    │ :5123                  │  │
-│  └────────────────────────┘    │    │    └────────────────────────┘  │
-│                                │    │                                │
-└────────────────────────────────┘    └────────────────────────────────┘
-              ▲                                   ▲
-              │           Encrypted Tunnel        │
-              └───────────────────────────────────┘
-              QUIC (TLS 1.3) — when UDP is filtered, switch the tunnel
-              protocol to TCP or KCP manually (no fallback transport)
-              legacy: TCP/KCP + ChaCha20-Poly1305 AEAD
-```
-
-- **🛡️ Bridge Server**: Sits inside the restricted network and dials outward to the node server to bypass filtering.
-- **🌐 Node Server**: Sits on the open internet and forwards incoming traffic to the final destination.
-
----
-
-## ⚡ Quick Installation
-
-> **Requirements:** Linux (amd64/arm64) with root access
-
-Install with a **single command**:
+۱. محتوای سورس را در **ریشه مخزن** قرار دهید، همراه `.github`، فایل‌های lock و تست‌ها. پوشه بیرونی ZIP یا `HESAR-final` را به‌عنوان زیرپوشه مخزن آپلود نکنید. در مخزن موجود:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Meytiz/HESAR/main/scripts/hesar.sh)
+git switch -c codex/panel-managed
+git add -A
+git commit -m "Manage tunnel carriers through the panel"
+git push -u origin codex/panel-managed
 ```
 
-The installer will:
+۲. در GitHub برای این branch یک Pull Request به `main` باز کنید. **Actions → CI** را بررسی کنید. `ci.yml` روی push، PR و اجرای دستی، پنل و دو باینری HESAR را می‌سازد، هسته‌ها را با نسخه و SHA-256 ثابت می‌گیرد، تست‌ها را اجرا می‌کند و بسته‌های کامل amd64/arm64 را در **Artifacts** همان اجرا می‌گذارد.
 
-- ✅ Install the `hesar` binary to `/usr/local/bin`
-- ✅ Create a dedicated `hesar` system user
-- ✅ Generate `/etc/hesar/data/config.json` with secure random values
-- ✅ Register and start the `hesar.service` in systemd
-
-**Sample output:**
-
-```
-======================================================================
-               HESAR QUICK START SETUP SUCCESSFUL
-======================================================================
-
-  GUI Panel Address : http://SERVER_IP:5123/
-  Listen Port       : 5123
-  Username          : admin_8392
-  Password          : Hesar#a8Kx9mN2pQ4w
-
-======================================================================
-  ⚠️  SAVE THESE CREDENTIALS — They won't be shown again!
-  ⚠️  Change password after first login.
-======================================================================
-```
-
-> 🔒 Credentials are randomly generated per install and never sent externally.
-
----
-
-## 📦 Offline Installation
-
-### Method 1 — Pre-built binary
-
-1. Download the appropriate build from [Releases](https://github.com/Meytiz/HESAR/releases).
-2. Transfer it to your server:
+۳. پس از موفقیت CI و ادغام، tag جدید و استفاده‌نشده بسازید:
 
 ```bash
-scp hesar-linux-amd64 root@SERVER_IP:/tmp/hesar
+git switch main
+git pull --ff-only
+git tag v2.1.0
+git push origin v2.1.0
 ```
 
-3. Run and install:
+`v2.1.0` مثال است؛ تکرار tag قبلی مجاز نیست. `build.yml` با tagهای `v*` دوباره تست و بیلد می‌گیرد، manifest و نصب‌کننده را با Sigstore امضا می‌کند و Release می‌سازد. GitHub Actions باید فعال باشد؛ job انتشار مجوز `contents: write` و `id-token: write` دارد.
+
+۴. فایل‌های Release:
+
+- `hesar-linux-amd64.tar.gz` و `hesar-linux-arm64.tar.gz`: HESAR، عامل، سه هسته، مجوزها و مستندات.
+- `install-hesar.sh`: نصب‌کننده با نام مخزن و هویت امضای همان workflow.
+- `checksums-sha256.txt`، امضاهای Sigstore و `BUILDINFO.json`.
+
+اگر Cosign روی میزبان نصب باشد، دانلود آنلاین manifest امضا و هویت workflow را بررسی می‌کند. بدون Cosign، SHA-256 فقط سلامت داده را بررسی می‌کند؛ ناشر احراز نمی‌شود. artifact آزمایشی CI و بسته QA محلی امضای Release ندارند.
+
+بیلد تولیدی، دریافت هسته‌ها و بسته‌بندی در GitHub انجام می‌شوند. باینری، `node_modules`، خروجی پنل، لاگ و کانفیگ خصوصی وارد Git نمی‌شوند. تست‌های `*_test.go` و تست نصب/شبکه برای CI لازم‌اند و داخل بسته اجرایی سرور قرار نمی‌گیرند.
+
+## نصب اولیه روی هر دو سرور
+
+میزبان پشتیبانی‌شده: **Debian 12+ یا Ubuntu 24.04+ با systemd**، amd64 یا arm64 و IPv4 قابل دسترس. نصب‌کننده Python 3.11+، iproute2، iptables، ping و وابستگی‌های اجرا را نصب می‌کند.
+
+از Release همان مخزن، `install-hesar.sh`، آرشیو معماری صحیح و `checksums-sha256.txt` را کنار هم روی هر سرور بگذارید. سپس:
 
 ```bash
-chmod +x /tmp/hesar
-sudo /tmp/hesar
+sudo bash install-hesar.sh --offline ./hesar-linux-amd64.tar.gz
 ```
 
-### Method 2 — Build manually
+`--offline` یعنی آرشیو برنامه محلی است؛ اگر وابستگی‌ها نصب نباشند، نصب بسته‌های سیستم به مخزن apt نیاز دارد. اگر آرشیو محلی ندارید، `sudo bash install-hesar.sh --quickstart` بسته کامل latest همان مخزن را دریافت می‌کند. نصب و به‌روزرسانی عملیات یک‌باره سیستمی‌اند؛ **انتخاب، کانفیگ، Start و Stop همه پروتکل‌ها از پنل است**.
 
-If you have limited internet access, build the frontend locally first, then compile the backend (see [Build From Source](#-build-from-source)).
-
----
-
-## 🔨 Build From Source
-
-### Prerequisites
-
-| Tool | Version |
-|---|---|
-| **Go** | 1.22+ |
-| **Node.js** | 18+ |
-| **npm** | 9+ |
-
-### Build the frontend
+پنل پیش‌فرض: **`http://SERVER_IP:8443`**؛ کاربر اولیه `admin` است. رمز تصادفی یک‌بار هنگام ایجاد تنظیمات در journal نوشته می‌شود:
 
 ```bash
-cd frontend
-npm install
-npm run build
+sudo journalctl -u hesar -n 50 --no-pager
 ```
 
-### Build the backend
+پس از ورود، رمز را از Settings تغییر دهید. پنل طبق طراحی HTTP می‌ماند؛ رمزها و JSON تنظیمات را فقط از مسیر مدیریتی مورد اعتماد خود منتقل کنید.
+
+نصب‌کننده پیش از فعال کردن نسل جدید، کامل بودن پنج باینری، معماری ELF و checksum اعضا را بررسی می‌کند. کانفیگ `/etc/hesar/data/config.json` حفظ می‌شود. نصب دوباره آرشیو یکسان تکرارپذیر است. نسل‌های قبلی برای بازیابی باقی می‌مانند و خودکار حذف نمی‌شوند.
+
+## راه‌اندازی از پنل
+
+همیشه **سرور خارج را اول** تنظیم کنید:
+
+1. **Tunnels → Add New Tunnel → Server Side Role: Overseas**.
+2. **Network profile** را انتخاب کنید. برای مسیرهای مدیریت‌شده، IP ایران را در **Other server WAN IPv4** بدهید. کارت و IP محلی خودکار تشخیص داده می‌شوند؛ override باید واقعاً روی همان میزبان اختصاص یافته باشد.
+3. **Connection Listen Port / Internal transport port** را مثلاً `18081` و **Target Forward Port** را پورت واقعی برنامه مقصد، مثلاً `8080` قرار دهید. Target host پیش‌فرض `127.0.0.1` است.
+4. **Generate encryption key** را بزنید. برای Paqet، REALITY و مسیرهای TLS، **Generate transport credentials** را نیز بزنید. گواهی معتبر خود را هم می‌توانید به شکل PEM در پنل وارد کنید.
+5. **Save Tunnel Configuration → Start**. شروع موفق یعنی منابع محلی آماده‌اند؛ هنوز سلامت ارتباط دو سرور ثابت نشده است.
+6. در کارت تونل **Copy peer setup** را بزنید. JSON را به پنل ایران ببرید: **Import peer setup → Apply peer setup**.
+7. روی ایران نام و **Local Listen Port(s)**، مثلاً `18080`، را بررسی کنید. کلیدهای مشترک، CA و IPهای خصوصی خودکار وارد می‌شوند. **Save → Start**.
+
+JSON شامل کلیدهای مشترک است؛ آن را در GitHub یا لاگ عمومی نگذارید. کلید خصوصی گواهی خارج و کلید خصوصی REALITY به ایران صادر نمی‌شوند. فهرست تونل‌ها کلیدهای حساس را پنهان می‌کند؛ ویرایش مقدار پنهان‌شده، کلید ذخیره‌شده را حفظ می‌کند.
+
+## GRE و IPIP
+
+پروفایل GRE یا IPIP را روی خارج انتخاب کنید. پیش‌فرض خارج `10.77.0.2` و ایران `10.77.0.1` است؛ export جای آن‌ها را برای ایران عوض می‌کند. MTU آغازین `1280` است؛ QUIC حداقل `1228` می‌خواهد و PMTU برای L3 خاموش می‌شود.
+
+قواعد فایروال محلی برای IP/پروتکل/پورت همان تونل نیز با شناسه مالکیت ایجاد و در Stop حذف می‌شوند. سیاست کلی INPUT/OUTPUT تغییر نمی‌کند؛ قاعده پذیرش متعلق به تونل پیش از رد عمومی قرار می‌گیرد.
+
+Start لینک با نام مشتق‌شده از ID، source route مخصوص همان دو IP و listener محدود به IP خصوصی می‌سازد. مسیر پیش‌فرض میزبان تغییر نمی‌کند. Stop منابع متعلق به همان تونل را جمع می‌کند. دستور `ip tunnel`، نام کارت و جدول route را دستی وارد نکنید. برای چند تونل هم‌زمان، جفت IP خصوصی متفاوت انتخاب کنید، مثلاً `10.77.1.1/10.77.1.2`؛ پورت‌های listener هم نباید تداخل داشته باشند.
+
+**GRE پروتکل IP شماره 47 و IPIP شماره 4 است؛ پورت TCP/UDP نیستند.** ACL دیتاسنتر باید عبور دوطرفه را اجازه دهد. عامل محلی نمی‌تواند ACL بیرون ماشین، NAT ناسازگار یا محدودیت اپراتور را تغییر دهد. دانلود موفق بدون آپلود، تأیید مسیر نیست.
+
+## Paqet
+
+پروفایل Paqet را انتخاب کنید. **Carrier public port** باید اختصاصی و حداقل `1024` باشد، مثلاً `19999`. از پورت سرویس دیگر استفاده نکنید. کلید Paqet را از پنل بسازید؛ از کلید داخلی HESAR مستقل است.
+
+عامل کارت/IP/MAC next hop را از route و neighbor پیدا می‌کند. قواعد NOTRACK و جلوگیری از RST فقط برای همان peer، IP و پورت با comment مالکیت درج می‌شوند. هسته با UID محدود HESAR و قابلیت‌های NET_RAW/NET_ADMIN اجرا می‌شود. Stop قواعد خود همان تونل را حذف می‌کند؛ اجرای دستی `iptables`، YAML و Paqet لازم نیست.
+
+این مسیر به packet capture، next hop قابل کشف و عبور TCP خام نیاز دارد. container بدون capability، NAT و فایروال stateful ممکن است ناسازگار باشند. نسخه همراه **alpha** است. خطای Start را از شکست انتقال روی مسیر جدا بررسی کنید.
+
+## REALITY/XHTTP و Hysteria
+
+**Xray:** دامنه پوشش TLS 1.3 قابل دسترس را در **REALITY cover server name** بدهید و کلید بسازید. `REALITY target` اختیاری است؛ پیش‌فرض همان دامنه روی 443 است. پورت عمومی می‌تواند 443 باشد؛ پورت داخلی HESAR را **متفاوت**، مثلاً `18081` قرار دهید. خروجی Xray فقط TCP به `127.0.0.1:InternalPort` را اجازه می‌دهد. شروع listener دسترسی به دامنه پوشش را ثابت نمی‌کند.
+
+**Hysteria:** نام گواهی و کلیدهای انتقال را بسازید. Salamander کلید مستقل دارد. export گواهی اعتماد را به ایران می‌دهد؛ `insecure` روشن نمی‌شود. این مسیر UDP است و UDP کاملاً مسدود را قابل استفاده نمی‌کند.
+
+گواهی خصوصی تولیدشده از پنل **۹۰ روز** اعتبار دارد. برای تمدید، گواهی/کلید جدید را روی خارج بسازید و ذخیره کنید. روی ایران، تونل قدیمی را Stop کنید، JSON تازه را import و Start کنید و پس از تست، رکورد قدیمی را حذف کنید. ACME در این نسخه پیاده نشده؛ PEM معتبر از پنل قابل ورود است. گواهی خصوصی خودساخته معادل گواهی عمومی وب نیست.
+
+## Shaped WSS، آزمایشی
+
+رکورد جریان داخل WSS payload حداکثر 16KiB و padding حداکثر 1152 بایت دارد. بعضی ارسال‌های کوچک به bucket طول مشخص با jitter تصادفی تبدیل می‌شوند. دریافت محدود است؛ TLS و AEAD موجود حفاظت داده را انجام می‌دهند. هر دو طرف باید همین پروتکل را انتخاب کنند.
+
+ادعای **روش منتشرنشده در جهان، تقلید کامل مرورگر یا مقاومت قطعی** نداریم. padding ایده‌ای شناخته‌شده است؛ این نسخه پیاده‌سازی قابل آزمون خودش را دارد. Go ClientHello، WebSocket و زمان‌بندی همچنان قابل تحلیل‌اند؛ padding می‌تواند هزینه یا الگوی قابل تشخیص دیگری ایجاد کند. WSS معمولی و Shaped WSS را با مقصد، ساعت و حجم یکسان مقایسه کنید و فقط با نتیجه بهتر از آن استفاده کنید.
+
+## آزمون و عیب‌یابی
+
+Tester پنل TCP/TLS/QUIC را برای مقصدهای عمومی می‌سنجد؛ timeout یا handshake موفق اثبات DPI یا سلامت تونل نیست. هدف‌های خصوصی/metadata در Tester عمومی رد می‌شوند.
+
+به پورت محلی ایران درخواست **واقعی برنامه مقصد** بفرستید؛ اگر مقصد HTTP است:
 
 ```bash
-cd backend
-rm -rf internal/api/dist
-cp -r ../frontend/dist internal/api/dist
-
-go mod download
-go build \
-  -ldflags="-s -w \
-  -X main.Version=$(git describe --tags --always) \
-  -X main.BuildDate=$(date +%Y-%m-%d)" \
-  -o hesar \
-  cmd/hesar/main.go
+curl --max-time 20 http://IRAN_SERVER_IP:18080/
 ```
 
-### Run directly
+برای TLS یا پروتکل دیگر client همان برنامه را استفاده کنید. فایل قابل مقایسه را در هر دو جهت و انتقال طولانی آزمایش کنید. در Logs پنل پیام اتصال/احراز هویت و در Tunnels وضعیت عامل را ببینید. `sudo bash install-hesar.sh --logs` فقط journal دو سرویس را می‌خواند و تنظیم دستی پروتکل نیست.
 
-```bash
-./hesar -config data/config.json
+برای مقایسه مسیر، زمان تهران، ASN، پروفایل، نسبت اتصال موفق، latency، hash/حجم فایل، سرعت رفت/برگشت و قطع‌ها را ثبت کنید. تست‌های مخزن آزمایشگاهی‌اند؛ ادعای سرعت یا عبور امروز ایران نیستند.
+
+## ساختار و نام فایل‌ها
+
+```text
+.github/workflows/ci.yml           بررسی PR و artifact آزمایشی
+.github/workflows/build.yml        بیلد و امضای Release از tag
+backend/cmd/hesar/                 پنل HTTP و انتقال احرازشده
+backend/cmd/hesar-agent/           عامل محلی Linux
+backend/internal/provision/       IPC محدود، کانفیگ هسته و مدیریت L3
+backend/internal/config/          اعتبارسنجی و ذخیره تنظیمات
+backend/internal/tunnel/          transportها و lifecycle
+frontend/                        پنل React
+scripts/install-hesar.sh           نصب بسته کامل
+scripts/fetch-release-cores.py     دریافت هسته pin شده و بررسی checksum
+scripts/build-linux-release.sh    مرحله بیلد workflow
+scripts/package-linux-release.py  ساخت آرشیو و manifest
+scripts/test-release-installer.sh  آزمون رد بسته خراب و حفظ نصب قبلی
+scripts/test-linux-layer3.py       آزمون لینک کرنل و محدودیت مسیر
+scripts/test-managed-transports.py آزمون API و هسته‌های واقعی
+docs/architecture.md              مرز دسترسی عامل شبکه
+docs/iran-dpi-research.fa.md            شواهد و منابع تحقیق
 ```
 
----
+پنل با UID `hesar` اجرا می‌شود. سرویس `hesar-agent` فقط عملیات مشخص را از Unix socket محلی با بررسی UID می‌پذیرد؛ حداکثر ۱۶ تونل تحت مدیریت عامل هم‌زمان مجاز است.  پنل نمی‌تواند shell، مسیر باینری دلخواه یا کانفیگ خام هسته ارسال کند. نسخه، checksum، مجوز و لینک سورس هسته‌ها در `CORE-VERSIONS.json` بسته ثبت می‌شوند.
 
-## ⚙️ Configuration
-
-Main configuration file:
-
-```
-/etc/hesar/data/config.json
-```
-
-### Server settings
-
-| Key | Description |
-|---|---|
-| `admin_username` | Web panel username |
-| `admin_password` | Web panel password |
-| `listen_port` | Main service and panel port |
-| `log_path` | Log storage path |
-| `log_max_size_mb` | Max size per log file (rotates after) |
-| `secret_key` | Master service key |
-
-### Tunnel settings
-
-| Key | Possible values |
-|---|---|
-| `protocol` | `quic` / `tcp` / `kcp` |
-| `mode` | `iran` or `overseas` |
-| `local_ports` | Local ports (e.g. `"80,443"`, max 64 per tunnel) |
-| `remote_ip` | Destination node address |
-| `remote_port` | Destination node port |
-| `target_port` | Final forward port |
-| `quic_enable_udp` | Optional, experimental: relay UDP via QUIC DATAGRAM (quic only) |
-
----
-
-## 🔐 Security
-
-| Layer | Implementation |
-|---|---|
-| 🔑 Key exchange | **X25519** elliptic curve |
-| 🛡️ Traffic encryption | **ChaCha20-Poly1305** AEAD |
-| 🧬 Key isolation | **HKDF** per session |
-| 🎲 Random salt | 32 random bytes per connection |
-| 🔓 API authentication | **JWT** for REST and WebSocket |
-| 🚦 Login protection | Rate-limited + constant-time credential check |
-| 👤 Dedicated user | Non-root user with systemd hardening |
-| 📂 Config file permissions | Enforced `0600` |
-| ✍️ Safe writes | Atomic writes for `config.json` |
-| 🛑 SSRF protection | In diagnostic tools |
-| ✅ Server-side validation | On all requests |
-
----
-
-## 🚀 Server Optimization
-
-To enable **TCP BBR** and tune kernel parameters:
-
-```bash
-sudo ./hesar.sh --optimize
-```
-
-This will:
-
-- ⚙️ Tune TCP kernel parameters
-- 🚀 Enable BBR if supported by the kernel
-- 💾 Persist `sysctl` values in `/etc/sysctl.d/99-hesar-tune.conf`
-
----
-
-## 📂 Project Structure
-
-```
-HESAR/
-├── 📁 backend/                    # 🐹 Go backend
-│   ├── 📁 cmd/hesar/
-│   │   └── 📄 main.go             # Application entry point
-│   ├── 📁 internal/
-│   │   ├── 📁 api/                # HTTP API + WebSocket + embedded frontend
-│   │   ├── 📁 config/             # Configuration management
-│   │   ├── 📁 system/             # systemd + sysctl operations
-│   │   └── 📁 tunnel/             # QUIC/TLS/TCP/KCP tunnel implementations
-│   ├── 📄 go.mod
-│   └── 📄 go.sum
-│
-├── 📁 frontend/                   # ⚛️ React + TypeScript UI
-│   ├── 📁 src/
-│   │   ├── 📁 components/         # UI components (Dashboard, Tunnels, ...)
-│   │   ├── 📁 pages/              # Main pages
-│   │   ├── 📁 services/           # API services
-│   │   ├── 📄 App.tsx             # Application root
-│   │   ├── 📄 main.tsx            # React entry point
-│   │   ├── 📄 types.ts            # TypeScript definitions
-│   │   └── 📄 index.css           # Global styles
-│   ├── 📄 index.html
-│   ├── 📄 package.json
-│   ├── 📄 tailwind.config.js
-│   ├── 📄 vite.config.ts
-│   └── 📄 tsconfig.json
-│
-├── 📁 scripts/
-│   └── 📄 hesar.sh                # CLI installer and manager
-│
-├── 📁 .github/workflows/
-│   └── 📄 build.yml               # GitHub Actions CI/CD
-│
-├── 📄 LICENSE                     # MIT License
-├── 📄 README.md                   # This file
-└── 📄 .gitignore
-```
-
----
-
-## 🔧 Troubleshooting
-
-| Issue | Solution |
-|---|---|
-| Port already in use | Change `listen_port` in `/etc/hesar/data/config.json` |
-| Permission denied | `chown -R hesar:hesar /etc/hesar` |
-| Web panel won't open | Open the port in your firewall: `ufw allow 5123/tcp` |
-| Service won't start | Inspect logs: `journalctl -u hesar -f` |
-| Tunnel won't connect | Ensure the cipher key matches on both endpoints |
-| Frontend build error | `rm -rf node_modules && npm install` and retry |
-| Web panel serves a blank page | The binary was built without staged panel assets. Run `npm run build` in `frontend/`, copy `frontend/dist/*` into `backend/internal/api/dist/`, rebuild. The daemon logs an explicit error for this case at startup. |
-| Tunnel shows "Offline" after editing it | Fixed in vNext: an edit no longer clears the stored `status`, so auto-start survives. If you are on an older build, start the tunnel once more after editing. |
-| Locked out of the panel with 429 | The login limiter used to count *successful* logins; it now clears an IP's bucket on success. Wait out the 15-minute window (or restart the daemon) on older builds. |
-| Tunnel configured with "tls" won't start        | The TLS-over-TCP fallback transport was removed. Edit the tunnel in the panel and set protocol to quic, tcp or kcp, then start it again.                                                                |
-
----
-
-## 🗺️ Roadmap
-
-* 🚧 WireGuard Transport
-* 🚧 Multi Node Clustering
-- 🚧 Monitoring and Alerts
-- 🚧 WebSocket Transport
-- 🚧 Prometheus Metrics Exporter
-- 🚧 High Availability
-- 🚧 Automatic Let's Encrypt TLS
-
----
-
-## 🤝 Contributing
-
-Suggestions, bug reports and feature requests are warmly welcome! 🎉
-
-1. 🍴 **Fork** the repository
-2. 🌿 Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. 💾 **Commit** your changes (`git commit -m 'Add amazing feature'`)
-4. 📤 **Push** the branch (`git push origin feature/amazing-feature`)
-5. 🔀 Open a **Pull Request**
-
-> ⚠️ For major changes, please open an **Issue** first to discuss what you would like to change.
-
----
-
-## 📜 License
-
-This project is licensed under the **[MIT License](https://github.com/Meytiz/HESAR/blob/main/LICENSE)**.
-
-```
-MIT License - Copyright (c) 2026 Meytiz (HESAR Project)
-```
-
----
-
-<div align="center">
-
-### 🌟 If HESAR helped you bypass restrictions, consider giving it a ⭐ on GitHub — it helps the project grow!
-
-<p>
-  <a href="https://github.com/Meytiz/HESAR/stargazers"><img src="https://img.shields.io/github/stars/Meytiz/HESAR?style=social" alt="GitHub stars"></a>
-  <a href="https://github.com/Meytiz/HESAR/network/members"><img src="https://img.shields.io/github/forks/Meytiz/HESAR?style=social" alt="GitHub forks"></a>
-  <a href="https://github.com/Meytiz/HESAR/watchers"><img src="https://img.shields.io/github/watchers/Meytiz/HESAR?style=social" alt="GitHub watchers"></a>
-</p>
-
-**Built with ❤️ by [Meytiz](https://github.com/Meytiz)**
-
-*Making the internet accessible for everyone*
-
-</div>
+پروژه تحت [LICENSE](LICENSE) است. مجوز هسته‌های همراه داخل `licenses` هر Release قرار دارد. معماری دقیق در [architecture.md](docs/architecture.md) توضیح داده شده است.

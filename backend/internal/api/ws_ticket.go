@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Meytiz/HESAR/backend/internal/config"
 	"github.com/Meytiz/HESAR/backend/internal/system"
 )
 
@@ -27,8 +29,9 @@ import (
 const wsTicketTTL = 30 * time.Second
 
 type wsTicketEntry struct {
-	expiresAt time.Time
-	remoteIP  string
+	expiresAt  time.Time
+	remoteIP   string
+	keyVersion [32]byte
 }
 
 type wsTicketStore struct {
@@ -54,8 +57,9 @@ func (s *wsTicketStore) issue(remoteIP string) (string, error) {
 	ticket := hex.EncodeToString(b)
 
 	s.tickets[ticket] = wsTicketEntry{
-		expiresAt: time.Now().Add(wsTicketTTL),
-		remoteIP:  remoteIP,
+		expiresAt:  time.Now().Add(wsTicketTTL),
+		remoteIP:   remoteIP,
+		keyVersion: sha256.Sum256([]byte(config.GlobalConfig.GetSecretKey())),
 	}
 	return ticket, nil
 }
@@ -78,6 +82,9 @@ func (s *wsTicketStore) consume(ticket, remoteIP string) bool {
 		return false
 	}
 	if entry.remoteIP != "" && entry.remoteIP != remoteIP {
+		return false
+	}
+	if entry.keyVersion != sha256.Sum256([]byte(config.GlobalConfig.GetSecretKey())) {
 		return false
 	}
 	return true

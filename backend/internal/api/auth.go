@@ -28,10 +28,11 @@ type LoginResponse struct {
 }
 
 type rateLimiter struct {
-	mu       sync.Mutex
-	attempts map[string][]time.Time
-	max      int
-	window   time.Duration
+	mu        sync.Mutex
+	attempts  map[string][]time.Time
+	max       int
+	window    time.Duration
+	nextSweep time.Time
 }
 
 var loginLimiter = &rateLimiter{
@@ -45,6 +46,17 @@ func (rl *rateLimiter) isAllowed(ip string) bool {
 	defer rl.mu.Unlock()
 	now := time.Now()
 	cutoff := now.Add(-rl.window)
+	if now.After(rl.nextSweep) {
+		for key, attempts := range rl.attempts {
+			if len(attempts) == 0 || !attempts[len(attempts)-1].After(cutoff) {
+				delete(rl.attempts, key)
+			}
+		}
+		rl.nextSweep = now.Add(time.Minute)
+	}
+	if _, exists := rl.attempts[ip]; !exists && len(rl.attempts) >= 4096 {
+		return false
+	}
 	var recent []time.Time
 	for _, t := range rl.attempts[ip] {
 		if t.After(cutoff) {
@@ -138,6 +150,7 @@ const (
 
 func AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		if config.GlobalConfig == nil {
 			jsonError(w, "system config not initialized", http.StatusInternalServerError)
 			return
@@ -158,13 +171,13 @@ func AuthMiddleware(next http.Handler) http.Handler {
 			jsonError(w, "token has been revoked", http.StatusUnauthorized)
 			return
 		}
-		secret := config.GlobalConfig.GetConfig().SecretKey
+		secret := config.GlobalConfig.GetSecretKey()
 		token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
 			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 			}
 			return []byte(secret), nil
-		}, jwt.WithIssuer(jwtIssuer), jwt.WithAudience(jwtAudience))
+		}, jwt.WithIssuer(jwtIssuer), jwt.WithAudience(jwtAudience), jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 		if err != nil || !token.Valid {
 			jsonError(w, "unauthorized token", http.StatusUnauthorized)
 			return

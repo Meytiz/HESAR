@@ -22,6 +22,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"time"
 
@@ -61,7 +62,25 @@ func isDisallowedTarget(ip net.IP) error {
 	if ip.Equal(net.IPv4(169, 254, 169, 254)) {
 		return fmt.Errorf("target %s is the cloud metadata endpoint (blocked)", ip)
 	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return fmt.Errorf("invalid target IP")
+	}
+	addr = addr.Unmap()
+	for _, reserved := range reservedNetworks {
+		if reserved.Contains(addr) {
+			return fmt.Errorf("target %s is in a reserved or non-public range", ip)
+		}
+	}
 	return nil
+}
+
+var reservedNetworks = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"), netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"), netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"), netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("2001:db8::/32"), netip.MustParsePrefix("64:ff9b::/96"),
 }
 
 func validateProbeTarget(targetIP string, port int) (net.IP, error) {
@@ -206,6 +225,6 @@ func RunQUICTest(targetIP string, port int) TestResult {
 	return TestResult{
 		Success: false,
 		Latency: time.Since(start).Milliseconds(),
-		Details: fmt.Sprintf("QUIC handshake with %s failed: %v (timeout usually means UDP is filtered; a version/transport error means a QUIC endpoint answered).", addr, err),
+		Details: fmt.Sprintf("QUIC handshake with %s failed: %v. Failure does not prove DPI: filtering, firewall rules, loss, ALPN mismatch or required client authentication may cause it. This probe is not an authenticated HESAR tunnel test.", addr, err),
 	}
 }

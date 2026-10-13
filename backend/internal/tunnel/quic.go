@@ -6,25 +6,20 @@ package tunnel
 //
 //	TCP application traffic  →  QUIC streams   (one stream per local TCP conn,
 //	                             multiplexed over ONE shared QUIC connection)
-//	UDP application traffic  →  QUIC DATAGRAM  (experimental, opt-in via
-//	                             TunnelConfig.QUICEnableUDP)
+//	UDP application traffic  →  temporarily disabled pending flow redesign
 //
 // Security model:
 //   - TLS 1.3 only (quic-go enforces TLS 1.3 for QUIC v1).
 //   - Authentication is PSK-based WITHOUT exposing the PSK: both sides
 //     deterministically derive the SAME Ed25519 server certificate from
-//     sha256(EncryptionKey) via HKDF. The overseas side presents it; the
-//     iran side pins the expected public key (derived from the same key)
-//     in VerifyPeerCertificate. An attacker without the EncryptionKey can
-//     neither impersonate the server nor predict the pin.
+//     sha256(EncryptionKey) via HKDF. Both peers present a certificate and
+//     pin the expected public key in VerifyPeerCertificate. This proves
+//     possession of the shared credential, not an individual node identity.
 //   - Forward secrecy comes from the ephemeral TLS 1.3 key exchange; the
 //     static certificate is an authentication credential only.
-//   - ALPN "hesar-quic/1" provides protocol versioning.
-// No fallback: when a QUIC dial fails (UDP filtered) the error is surfaced
-// to the operator, who switches the tunnel to the TCP or KCP transport
-// manually. The TLS 1.3-over-TCP fallback transport has been REMOVED —
-// every tunnel runs exactly one protocol, which keeps behaviour auditable
-// and removes a whole transport (and its ALPN) from the attack surface.
+//   - ALPN "hesar-quic/2" requires mutual credential verification.
+// Native QUIC has a custom ALPN and is not HTTP/3 camouflage. The optional
+// auto handler provides WSS fallback and uses an explicit readiness exchange.
 
 import (
 	"context"
@@ -34,16 +29,15 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	xhkdf "golang.org/x/crypto/hkdf"
 	"io"
 	"math/big"
 	"net"
-	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Meytiz/HESAR/backend/internal/config"
@@ -55,20 +49,11 @@ const (
 	// AlpnQUIC is the ALPN token of the QUIC transport. Bumping it is the
 	// protocol-versioning mechanism: peers advertising different ALPNs
 	// fail the TLS handshake loudly instead of misinterpreting frames.
-	AlpnQUIC = "hesar-quic/1"
+	AlpnQUIC     = "hesar-quic/2"
+	AlpnAutoQUIC = "hesar-auto/1"
 
-	// envEnableQUICDatagram gates the experimental UDP-over-DATAGRAM path.
-	// QUIC DATAGRAM (RFC 9221) is unreliable-by-design; the relay here is
-	// best-effort and intentionally kept behind a feature flag until the
-	// MASQUE CONNECT-UDP profile is adopted.
-	envEnableQUICDatagram = "HESAR_ENABLE_QUIC_DATAGRAM"
-
-	quicDialTimeout   = 8 * time.Second
-	quicIdleTimeout   = 30 * time.Second
-	quicHandshakeTO   = 8 * time.Second
-	maxDatagramFlows  = 4096
-	datagramFlowTTL   = 60 * time.Second
-	maxDatagramPayLen = 65000
+	quicDialTimeout = 8 * time.Second
+	quicIdleTimeout = 30 * time.Second
 )
 
 // quicCertSalt / quicCertInfo domain-separate the deterministic certificate
@@ -77,16 +62,6 @@ var (
 	quicCertSalt = []byte("HESAR_QUIC_CERT_SALT_v1")
 	quicCertInfo = []byte("HESAR_QUIC_ED25519_CERT_v1")
 )
-
-// datagramEnabled reports whether the experimental UDP relay is enabled.
-func datagramEnabled() bool {
-	v := os.Getenv(envEnableQUICDatagram)
-	if v == "" {
-		return false
-	}
-	b, err := strconv.ParseBool(v)
-	return err == nil && b
-}
 
 // DeriveQUICCert deterministically derives the tunnel's Ed25519 certificate
 // from the pre-shared key, and returns it together with the public key that
@@ -162,15 +137,21 @@ func ed25519PublicKeyEqual(a, b ed25519.PublicKey) bool {
 }
 
 func serverTLSConfig(cert *tls.Certificate) *tls.Config {
+	// Both peers must prove possession of the shared credential. Requiring
+	// a certificate alone is insufficient: verify its pinned public key too.
+	pin := cert.PrivateKey.(ed25519.PrivateKey).Public().(ed25519.PublicKey)
 	return &tls.Config{
-		Certificates: []tls.Certificate{*cert},
-		NextProtos:   []string{AlpnQUIC},
-		MinVersion:   tls.VersionTLS13,
+		Certificates:          []tls.Certificate{*cert},
+		ClientAuth:            tls.RequireAnyClientCert,
+		VerifyPeerCertificate: pinVerifier(pin),
+		NextProtos:            []string{AlpnQUIC},
+		MinVersion:            tls.VersionTLS13,
 	}
 }
 
-func clientTLSConfig(pin ed25519.PublicKey) *tls.Config {
+func clientTLSConfig(cert *tls.Certificate, pin ed25519.PublicKey) *tls.Config {
 	return &tls.Config{
+		Certificates:          []tls.Certificate{*cert},
 		InsecureSkipVerify:    true, // trust is established by the pin below
 		VerifyPeerCertificate: pinVerifier(pin),
 		NextProtos:            []string{AlpnQUIC},
@@ -181,9 +162,10 @@ func clientTLSConfig(pin ed25519.PublicKey) *tls.Config {
 // quicStreamConn adapts a quic.Stream to net.Conn so the shared
 // ProxyBidirectional helper can be reused unchanged.
 type quicStreamConn struct {
-	s     *quic.Stream
-	laddr net.Addr
-	raddr net.Addr
+	s           *quic.Stream
+	laddr       net.Addr
+	raddr       net.Addr
+	writeClosed atomic.Bool
 }
 
 func (q *quicStreamConn) Read(b []byte) (int, error)  { return q.s.Read(b) }
@@ -195,14 +177,21 @@ func (q *quicStreamConn) Write(b []byte) (int, error) { return q.s.Write(b) }
 // shared QUIC connection — until that connection is torn down.
 func (q *quicStreamConn) Close() error {
 	q.s.CancelRead(0)
-	return q.s.Close()
+	if !q.writeClosed.Load() {
+		q.s.CancelWrite(0)
+	}
+	return nil
 }
 
 // CloseWrite closes just the send direction (i.e. it emits the FIN that lets
 // the peer's Read return EOF). ProxyBidirectional calls it through the
 // closeWriter interface for prompt, correct half-close teardown; *net.TCPConn
 // and *tls.Conn expose the same capability.
-func (q *quicStreamConn) CloseWrite() error { return q.s.Close() }
+func (q *quicStreamConn) CloseWrite() error {
+	// Preserve a graceful FIN: resetting after Close can discard queued data.
+	q.writeClosed.Store(true)
+	return q.s.Close()
+}
 
 func (q *quicStreamConn) LocalAddr() net.Addr                { return q.laddr }
 func (q *quicStreamConn) RemoteAddr() net.Addr               { return q.raddr }
@@ -220,6 +209,7 @@ type QUICHandler struct {
 	tcpListeners []net.Listener
 	udpSockets   []net.PacketConn
 	quicListener *quic.Listener
+	serverConns  map[*quic.Conn]struct{}
 	pool         *ConnPool
 
 	psk    []byte
@@ -229,34 +219,32 @@ type QUICHandler struct {
 
 	// iran side: one shared QUIC connection to the overseas node; every
 	// local TCP connection becomes a stream on it.
-	dialMu     sync.Mutex
-	clientConn *quic.Conn
+	dialMu          sync.Mutex
+	clientConn      *quic.Conn
+	clientTransport *quic.Transport
+	clientSocket    *net.UDPConn
 }
 
 // NewQUICHandler constructs a handler for the QUIC transport.
 func NewQUICHandler(cfg *config.TunnelConfig) *QUICHandler {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &QUICHandler{
-		cfg:    cfg,
-		ctx:    ctx,
-		cancel: cancel,
-		pool:   NewConnPool(DefaultMaxConcurrentHandshakes),
+		cfg:         cfg,
+		ctx:         ctx,
+		cancel:      cancel,
+		pool:        NewConnPool(0),
+		serverConns: make(map[*quic.Conn]struct{}),
 	}
 }
 
 // Start implements TunnelHandler.
 func (h *QUICHandler) Start() error {
-	psk := sha256.Sum256([]byte(h.cfg.EncryptionKey))
-	h.psk = psk[:]
-
-	cert, pin, err := DeriveQUICCert(h.psk)
-	if err != nil {
-		return fmt.Errorf("QUIC derive certificate: %w", err)
+	if _, err := underlayAddress(h.ctx, h.cfg); err != nil {
+		return err
 	}
-	h.cert = cert
-	h.pin = pin
-	h.useUDP = datagramEnabled() && h.cfg.QUICEnableUDP
-
+	if err := h.prepare(); err != nil {
+		return err
+	}
 	switch h.cfg.Mode {
 	case "iran":
 		return h.startIran()
@@ -267,6 +255,26 @@ func (h *QUICHandler) Start() error {
 	}
 }
 
+func (h *QUICHandler) prepare() error {
+	// Fail closed rather than silently provide a broken UDP relay. Keep the
+	// experimental implementation isolated until flow routing is redesigned.
+	if h.cfg.QUICEnableUDP {
+		return errors.New("QUIC UDP relay is temporarily disabled; set quic_enable_udp=false")
+	}
+	psk := sha256.Sum256([]byte(h.cfg.EncryptionKey))
+	h.psk = psk[:]
+
+	cert, pin, err := DeriveQUICCert(h.psk)
+	if err != nil {
+		return fmt.Errorf("QUIC derive certificate: %w", err)
+	}
+	h.cert = cert
+	h.pin = pin
+	h.useUDP = false
+
+	return nil
+}
+
 func (h *QUICHandler) startIran() error {
 	ports, err := ParsePorts(h.cfg.LocalPorts)
 	if err != nil {
@@ -274,7 +282,7 @@ func (h *QUICHandler) startIran() error {
 	}
 	h.mu.Lock()
 	for _, port := range ports {
-		l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		l, err := net.Listen("tcp", listenAddr(h.cfg, port))
 		if err != nil {
 			h.mu.Unlock()
 			h.Stop()
@@ -283,16 +291,6 @@ func (h *QUICHandler) startIran() error {
 		h.tcpListeners = append(h.tcpListeners, l)
 		go h.runIranTCPListener(l)
 
-		if h.useUDP {
-			pc, err := net.ListenPacket("udp", fmt.Sprintf(":%d", port))
-			if err != nil {
-				h.mu.Unlock()
-				h.Stop()
-				return fmt.Errorf("QUIC listen udp port %d: %w", port, err)
-			}
-			h.udpSockets = append(h.udpSockets, pc)
-			go h.runIranUDPRelay(pc)
-		}
 	}
 	h.mu.Unlock()
 
@@ -301,22 +299,25 @@ func (h *QUICHandler) startIran() error {
 }
 
 func (h *QUICHandler) startOverseas() error {
-	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", h.cfg.RemotePort))
-	if err != nil {
-		return fmt.Errorf("QUIC overseas resolve: %w", err)
+	// ListenAddr owns its UDP socket and transport; closing the listener
+	// releases both, unlike a manually created Transport with a borrowed socket.
+	tlsConfig := serverTLSConfig(h.cert)
+	if h.cfg.Protocol == ProtocolAuto {
+		tlsConfig.NextProtos = []string{AlpnAutoQUIC}
 	}
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return fmt.Errorf("QUIC overseas listen udp port %d: %w", h.cfg.RemotePort, err)
-	}
-	tr := &quic.Transport{Conn: udpConn}
-	ln, err := tr.Listen(serverTLSConfig(h.cert), &quic.Config{
-		MaxIdleTimeout:  quicIdleTimeout,
-		KeepAlivePeriod: 10 * time.Second,
-		EnableDatagrams: h.useUDP,
+	ln, err := quic.ListenAddr(listenAddr(h.cfg, h.cfg.RemotePort), tlsConfig, &quic.Config{
+		MaxIdleTimeout:          quicIdleTimeout,
+		HandshakeIdleTimeout:    dialTimeout(h.cfg),
+		InitialPacketSize:       1200,
+		DisablePathMTUDiscovery: h.cfg.QUICDisablePMTU || h.cfg.UnderlayInterface != "",
+		KeepAlivePeriod:         10 * time.Second,
+		// -1 disables incoming unidirectional streams (0 would select the
+		// library default); this transport only opens bidirectional streams.
+		MaxIncomingStreams:    maxSessionsPerTunnel,
+		MaxIncomingUniStreams: -1,
+		EnableDatagrams:       h.useUDP,
 	})
 	if err != nil {
-		_ = udpConn.Close()
 		return fmt.Errorf("QUIC overseas quic listen: %w", err)
 	}
 	h.mu.Lock()
@@ -331,7 +332,11 @@ func (h *QUICHandler) startOverseas() error {
 // Stop implements TunnelHandler.
 func (h *QUICHandler) Stop() {
 	h.cancel()
+	h.pool.CloseAll()
 	h.mu.Lock()
+	for conn := range h.serverConns {
+		_ = conn.CloseWithError(0, "tunnel stopped")
+	}
 	for _, l := range h.tcpListeners {
 		_ = l.Close()
 	}
@@ -351,6 +356,7 @@ func (h *QUICHandler) Stop() {
 		_ = h.clientConn.CloseWithError(0, "tunnel stopped")
 		h.clientConn = nil
 	}
+	h.closeClientUnderlay()
 	h.dialMu.Unlock()
 	system.LogInfo("QUIC tunnel [%s] stopped", h.cfg.Name)
 }
@@ -360,31 +366,67 @@ func (h *QUICHandler) Stop() {
 func (h *QUICHandler) getSharedConn() (*quic.Conn, error) {
 	h.dialMu.Lock()
 	defer h.dialMu.Unlock()
+	source, err := underlayAddress(h.ctx, h.cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	if h.clientConn != nil {
 		select {
 		case <-h.clientConn.Context().Done():
 			h.clientConn = nil
+			h.closeClientUnderlay()
 		default:
 			return h.clientConn, nil
 		}
 	}
 
 	remoteAddr := net.JoinHostPort(h.cfg.RemoteIP, strconv.Itoa(h.cfg.RemotePort))
-	dialCtx, cancel := context.WithTimeout(h.ctx, quicDialTimeout)
+	dialCtx, cancel := context.WithTimeout(h.ctx, dialTimeout(h.cfg))
 	defer cancel()
 
-	conn, err := quic.DialAddr(dialCtx, remoteAddr, clientTLSConfig(h.pin), &quic.Config{
-		MaxIdleTimeout:       quicIdleTimeout,
-		KeepAlivePeriod:      10 * time.Second,
-		HandshakeIdleTimeout: quicHandshakeTO,
-		EnableDatagrams:      h.useUDP,
-	})
+	tlsConfig := clientTLSConfig(h.cert, h.pin)
+	if h.cfg.Protocol == ProtocolAuto {
+		tlsConfig.NextProtos = []string{AlpnAutoQUIC}
+	}
+	quicConfig := &quic.Config{
+		MaxIdleTimeout:          quicIdleTimeout,
+		KeepAlivePeriod:         10 * time.Second,
+		HandshakeIdleTimeout:    dialTimeout(h.cfg),
+		InitialPacketSize:       1200,
+		DisablePathMTUDiscovery: h.cfg.QUICDisablePMTU,
+		EnableDatagrams:         h.useUDP,
+	}
+	quicConfig.DisablePathMTUDiscovery = h.cfg.QUICDisablePMTU || h.cfg.UnderlayInterface != ""
+	var conn *quic.Conn
+	if source == nil {
+		conn, err = quic.DialAddr(dialCtx, remoteAddr, tlsConfig, quicConfig)
+	} else {
+		peer := &net.UDPAddr{IP: net.ParseIP(h.cfg.RemoteIP).To4(), Port: h.cfg.RemotePort}
+		h.clientSocket, err = net.ListenUDP("udp4", &net.UDPAddr{IP: source})
+		if err == nil {
+			h.clientTransport = &quic.Transport{Conn: h.clientSocket}
+			conn, err = h.clientTransport.Dial(dialCtx, peer, tlsConfig, quicConfig)
+		}
+	}
 	if err != nil {
+		h.closeClientUnderlay()
 		return nil, fmt.Errorf("QUIC dial %s: %w", remoteAddr, err)
 	}
 	h.clientConn = conn
 	return conn, nil
+}
+
+// Caller holds dialMu; quic.Transport borrows the explicitly bound socket.
+func (h *QUICHandler) closeClientUnderlay() {
+	if h.clientTransport != nil {
+		_ = h.clientTransport.Close()
+		h.clientTransport = nil
+	}
+	if h.clientSocket != nil {
+		_ = h.clientSocket.Close()
+		h.clientSocket = nil
+	}
 }
 
 func (h *QUICHandler) runIranTCPListener(l net.Listener) {
@@ -400,7 +442,7 @@ func (h *QUICHandler) runIranTCPListener(l net.Listener) {
 				continue
 			}
 		}
-		go func(c net.Conn) {
+		h.pool.Run(clientConn, func(c net.Conn) {
 			defer c.Close()
 
 			acqCtx, cancel := context.WithTimeout(h.ctx, 30*time.Second)
@@ -428,13 +470,8 @@ func (h *QUICHandler) runIranTCPListener(l net.Listener) {
 			cancel()
 			if err != nil {
 				system.LogError("QUIC Iran open stream: %v", err)
-				// Force redial on next attempt: the connection is likely dead.
-				h.dialMu.Lock()
-				if h.clientConn == qconn {
-					_ = h.clientConn.CloseWithError(0, "stream open failed")
-					h.clientConn = nil
-				}
-				h.dialMu.Unlock()
+				// A stream-capacity timeout is not a connection failure.
+				// getSharedConn replaces only connections whose context ended.
 				return
 			}
 
@@ -444,12 +481,12 @@ func (h *QUICHandler) runIranTCPListener(l net.Listener) {
 
 			sc := &quicStreamConn{s: stream, laddr: c.LocalAddr(), raddr: c.RemoteAddr()}
 			defer sc.Close()
-			ProxyBidirectional(c, sc, func(in, out int64) {
+			proxyWithTimeout(h.ctx, c, sc, func(in, out int64) {
 				if config.GlobalConfig != nil {
 					_ = config.GlobalConfig.UpdateTunnelStats(h.cfg.ID, in, out)
 				}
-			})
-		}(clientConn)
+			}, idleTimeout(h.cfg))
+		})
 	}
 }
 
@@ -466,286 +503,64 @@ func (h *QUICHandler) runOverseasAcceptLoop(ln *quic.Listener) {
 				continue
 			}
 		}
+		h.mu.Lock()
+		if h.ctx.Err() != nil || len(h.serverConns) >= 32 {
+			h.mu.Unlock()
+			_ = qconn.CloseWithError(0, "session capacity reached or tunnel stopped")
+			continue
+		}
+		h.serverConns[qconn] = struct{}{}
+		h.mu.Unlock()
 		go h.serveOverseasConn(qconn)
 	}
 }
 
 func (h *QUICHandler) serveOverseasConn(qconn *quic.Conn) {
-	defer qconn.CloseWithError(0, "session ended")
-
-	dgState := qconn.ConnectionState().SupportsDatagrams
-	if h.useUDP && dgState.Local && dgState.Remote {
-		go h.runOverseasDatagrams(qconn)
-	}
+	defer func() {
+		_ = qconn.CloseWithError(0, "session ended")
+		h.mu.Lock()
+		delete(h.serverConns, qconn)
+		h.mu.Unlock()
+	}()
 
 	for {
 		stream, err := qconn.AcceptStream(h.ctx)
 		if err != nil {
 			return
 		}
-		go func(s *quic.Stream) {
-			if err := h.pool.Acquire(h.ctx); err != nil {
-				s.CancelRead(0)
-				s.CancelWrite(0)
+		sc := &quicStreamConn{s: stream, laddr: qconn.LocalAddr(), raddr: qconn.RemoteAddr()}
+		h.pool.Run(sc, func(c net.Conn) {
+			if err := h.pool.Acquire(qconn.Context()); err != nil {
 				return
 			}
-			targetAddr := fmt.Sprintf("127.0.0.1:%d", h.cfg.TargetPort)
-			targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+			if h.cfg.Protocol == ProtocolAuto {
+				_ = c.SetDeadline(time.Now().Add(dialTimeout(h.cfg)))
+				var hello [1]byte
+				if _, err := io.ReadFull(c, hello[:]); err != nil || hello[0] != 1 {
+					h.pool.Release()
+					return
+				}
+			}
+			targetAddr := targetAddr(h.cfg)
+			dialer := &net.Dialer{Timeout: dialTimeout(h.cfg)}
+			targetConn, err := dialer.DialContext(qconn.Context(), "tcp", targetAddr)
 			h.pool.Release()
 			if err != nil {
 				system.LogError("QUIC Overseas connect to [%s]: %v", targetAddr, err)
-				s.CancelRead(0)
-				s.CancelWrite(0)
 				return
 			}
-			sc := &quicStreamConn{s: s, laddr: qconn.LocalAddr(), raddr: qconn.RemoteAddr()}
-			defer sc.Close()
 			defer targetConn.Close()
-			ProxyBidirectional(sc, targetConn, func(in, out int64) {
+			if h.cfg.Protocol == ProtocolAuto {
+				if _, err := c.Write([]byte{0}); err != nil {
+					return
+				}
+				_ = c.SetDeadline(time.Time{})
+			}
+			proxyWithTimeout(qconn.Context(), c, targetConn, func(in, out int64) {
 				if config.GlobalConfig != nil {
 					_ = config.GlobalConfig.UpdateTunnelStats(h.cfg.ID, in, out)
 				}
-			})
-		}(stream)
-	}
-}
-
-// ──────────────────────────────────────────────────
-// Experimental UDP relay over QUIC DATAGRAM (RFC 9221)
-//
-// Wire format of every datagram: [2-byte big-endian flow ID][payload]
-// iran: maps local UDP endpoints to flow IDs and relays both directions.
-// overseas: maps flow IDs to UDP "connections" toward 127.0.0.1:TargetPort.
-// ──────────────────────────────────────────────────
-
-type udpFlowEntry struct {
-	local    net.Addr
-	lastSeen time.Time
-}
-
-func (h *QUICHandler) runIranUDPRelay(pc net.PacketConn) {
-	type revEntry struct {
-		id       uint16
-		local    net.Addr
-		lastSeen time.Time
-	}
-	var mu sync.Mutex
-	byAddr := make(map[string]uint16)
-	byID := make(map[uint16]udpFlowEntry)
-	var nextID uint16 = 1
-
-	go func() {
-		for {
-			qconn, err := h.getSharedConn()
-			if err != nil {
-				select {
-				case <-h.ctx.Done():
-					return
-				case <-time.After(time.Second):
-					continue
-				}
-			}
-			for {
-				select {
-				case <-h.ctx.Done():
-					return
-				case <-qconn.Context().Done():
-					break
-				default:
-				}
-				dgCtx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
-				data, err := qconn.ReceiveDatagram(dgCtx)
-				cancel()
-				if err != nil {
-					if errors.Is(h.ctx.Err(), context.Canceled) {
-						return
-					}
-					break // connection likely dead → outer loop redials
-				}
-				if len(data) < 3 {
-					continue
-				}
-				id := binary.BigEndian.Uint16(data[:2])
-				mu.Lock()
-				entry, ok := byID[id]
-				if ok {
-					entry.lastSeen = time.Now()
-					byID[id] = entry
-				}
-				mu.Unlock()
-				if !ok {
-					continue
-				}
-				_, _ = pc.WriteTo(data[2:], entry.local)
-			}
-		}
-	}()
-
-	buf := make([]byte, maxDatagramPayLen)
-	for {
-		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
-		n, addr, err := pc.ReadFrom(buf)
-		if err != nil {
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
-				select {
-				case <-h.ctx.Done():
-					return
-				default:
-					h.expireFlows(&mu, byAddr, byID)
-					continue
-				}
-			}
-			return
-		}
-		if n == 0 {
-			continue
-		}
-		key := addr.String()
-		mu.Lock()
-		id, ok := byAddr[key]
-		if !ok {
-			if len(byAddr) >= maxDatagramFlows {
-				mu.Unlock()
-				continue // flow table full — drop, document in README
-			}
-			id = nextID
-			nextID++
-			if nextID == 0 {
-				nextID = 1
-			}
-			byAddr[key] = id
-			byID[id] = udpFlowEntry{local: addr, lastSeen: time.Now()}
-		} else {
-			e := byID[id]
-			e.lastSeen = time.Now()
-			byID[id] = e
-		}
-		mu.Unlock()
-
-		qconn, err := h.getSharedConn()
-		if err != nil {
-			continue
-		}
-		payload := make([]byte, 2+n)
-		binary.BigEndian.PutUint16(payload[:2], id)
-		copy(payload[2:], buf[:n])
-		if err := qconn.SendDatagram(payload); err != nil {
-			system.LogWarn("QUIC Iran send datagram: %v", err)
-		}
-	}
-}
-
-func (h *QUICHandler) expireFlows(mu *sync.Mutex, byAddr map[string]uint16, byID map[uint16]udpFlowEntry) {
-	mu.Lock()
-	defer mu.Unlock()
-	now := time.Now()
-	for id, e := range byID {
-		if now.Sub(e.lastSeen) > datagramFlowTTL {
-			delete(byAddr, e.local.String())
-			delete(byID, id)
-		}
-	}
-}
-
-func (h *QUICHandler) runOverseasDatagrams(qconn *quic.Conn) {
-	type flow struct {
-		uc   *net.UDPConn
-		stop context.CancelFunc
-	}
-	var mu sync.Mutex
-	flows := make(map[uint16]*flow)
-	defer func() {
-		mu.Lock()
-		for _, f := range flows {
-			f.stop()
-			_ = f.uc.Close()
-		}
-		mu.Unlock()
-	}()
-
-	targetAddr := fmt.Sprintf("127.0.0.1:%d", h.cfg.TargetPort)
-
-	for {
-		select {
-		case <-h.ctx.Done():
-			return
-		case <-qconn.Context().Done():
-			return
-		default:
-		}
-		dgCtx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
-		data, err := qconn.ReceiveDatagram(dgCtx)
-		cancel()
-		if err != nil {
-			if errors.Is(h.ctx.Err(), context.Canceled) || errors.Is(qconn.Context().Err(), context.Canceled) {
-				return
-			}
-			if qconn.Context().Err() != nil {
-				return
-			}
-			continue
-		}
-		if len(data) < 3 {
-			continue
-		}
-		id := binary.BigEndian.Uint16(data[:2])
-
-		mu.Lock()
-		f, ok := flows[id]
-		if !ok {
-			if len(flows) >= maxDatagramFlows {
-				mu.Unlock()
-				continue
-			}
-			raddr, err := net.ResolveUDPAddr("udp", targetAddr)
-			if err != nil {
-				mu.Unlock()
-				continue
-			}
-			uc, err := net.DialUDP("udp", nil, raddr)
-			if err != nil {
-				mu.Unlock()
-				system.LogError("QUIC Overseas datagram dial target: %v", err)
-				continue
-			}
-			fCtx, fCancel := context.WithCancel(h.ctx)
-			f = &flow{uc: uc, stop: fCancel}
-			flows[id] = f
-			// Responses from the target flow back with the same flow ID.
-			go func(id uint16, uc *net.UDPConn, fCtx context.Context) {
-				buf := make([]byte, maxDatagramPayLen)
-				for {
-					_ = uc.SetReadDeadline(time.Now().Add(time.Second))
-					n, err := uc.Read(buf)
-					if err != nil {
-						select {
-						case <-fCtx.Done():
-							return
-						default:
-							var netErr net.Error
-							if errors.As(err, &netErr) && netErr.Timeout() {
-								continue
-							}
-							return
-						}
-					}
-					if n == 0 {
-						continue
-					}
-					payload := make([]byte, 2+n)
-					binary.BigEndian.PutUint16(payload[:2], id)
-					copy(payload[2:], buf[:n])
-					if err := qconn.SendDatagram(payload); err != nil {
-						return
-					}
-				}
-			}(id, uc, fCtx)
-		}
-		mu.Unlock()
-
-		if _, err := f.uc.Write(data[2:]); err != nil {
-			system.LogWarn("QUIC Overseas datagram write target: %v", err)
-		}
+			}, idleTimeout(h.cfg))
+		})
 	}
 }

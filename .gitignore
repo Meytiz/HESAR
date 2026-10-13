@@ -3,6 +3,15 @@ backend/hesar
 backend/hesar.exe
 backend/__debug_bin
 frontend/dist/
+release/
+frontend/pnpm-lock.yaml
+private-pair/
+credentials.json
+bridge.json
+overseas.json
+*-layer3.json
+__pycache__/
+*.pyc
 node_modules/
 *.o
 *.so
@@ -13,7 +22,7 @@ node_modules/
 # embeds (`//go:embed all:dist`). The directory and a tracked placeholder MUST
 # exist, otherwise every Go tool on a fresh checkout dies with
 # "pattern all:dist: no matching files found" — only the real build output
-# staged there (by CI or by the README instructions) is ignored.
+# staged there by GitHub Actions is ignored.
 backend/internal/api/dist/*
 !backend/internal/api/dist/.gitkeep
 

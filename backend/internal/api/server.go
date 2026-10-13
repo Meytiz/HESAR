@@ -41,12 +41,12 @@ func StartServer(ctx context.Context, port int) error {
 	// without index.html the SPA below can only 404.
 	if _, err := staticFiles.Open("dist/index.html"); err != nil {
 		system.LogError("Embedded panel assets are missing (dist/index.html): the web UI will not load.")
-		system.LogError("Build the frontend and stage it: cd frontend && npm ci && npm run build, then copy frontend/dist/* into backend/internal/api/dist/.")
+		system.LogError("Install the complete GitHub release built with embedded panel assets.")
 	}
 
 	mux.HandleFunc("/api/auth/status", StatusHandler)
 	mux.HandleFunc("/api/auth/login", LoginHandler)
-	mux.HandleFunc("/api/auth/logout", LogoutHandler)
+	mux.Handle("/api/auth/logout", AuthMiddleware(http.HandlerFunc(LogoutHandler)))
 	// Session probe for the SPA's route guard: unlike the public
 	// /api/auth/status, this only answers 200 while the caller's JWT is
 	// still valid (and not revoked), so "has a token" and "is authenticated"
@@ -79,6 +79,10 @@ func StartServer(ctx context.Context, port int) error {
 			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})))
+	mux.Handle("/api/network/profiles", AuthMiddleware(http.HandlerFunc(NetworkProfilesHandler)))
+	mux.Handle("/api/network/runtime", AuthMiddleware(http.HandlerFunc(NetworkRuntimeHandler)))
+	mux.Handle("/api/network/keys", AuthMiddleware(http.HandlerFunc(NetworkKeysHandler)))
+	mux.Handle("/api/network/peer-config", AuthMiddleware(http.HandlerFunc(NetworkPeerHandler)))
 
 	mux.Handle("/api/tunnels/", AuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
@@ -125,7 +129,10 @@ func StartServer(ctx context.Context, port int) error {
 		if cleanedPath == "" {
 			cleanedPath = "index.html"
 		}
-		_, openErr := distFS.Open(cleanedPath)
+		file, openErr := distFS.Open(cleanedPath)
+		if openErr == nil {
+			_ = file.Close()
+		}
 		if openErr != nil {
 			r.URL.Path = "/"
 			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -136,11 +143,12 @@ func StartServer(ctx context.Context, port int) error {
 	})
 
 	server := &http.Server{
-		Addr:         fmt.Sprintf("0.0.0.0:%d", port),
-		Handler:      mux,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              fmt.Sprintf("0.0.0.0:%d", port),
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		ReadTimeout:       20 * time.Second,
+		MaxHeaderBytes:    32 * 1024,
 	}
 
 	go func() {

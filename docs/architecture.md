@@ -1,0 +1,27 @@
+# HESAR architecture
+
+The HTTP panel and authenticated native transports run as the unprivileged `hesar` account. A separate Linux service, `hesar-agent`, owns narrowly scoped network operations. It accepts typed JSON over `/run/hesar-agent/control.sock`, checks kernel `SO_PEERCRED`, and accepts only the configured service UID or root. It has no TCP management listener.
+
+The full Linux installation also provisions comment-tagged host firewall rules for native transports. Rules allow only the configured endpoint/protocol/port; they precede generic deny rules but never change INPUT/OUTPUT policy. DNS allowances are limited to configured IPv4 resolvers when a hostname is required, and resolved destinations are pinned for the running tunnel. Only recorded literal rules are removed during cleanup.
+
+The panel supports `ensure`, `release`, `status` and conservative fixed `optimize` operations. Unknown fields, arbitrary commands, executable paths and raw core configuration are rejected. Request size, managed entry count, native sessions, dial time and record sizes are bounded. Generated files live in a root-owned registry; secrets are private or group-readable only where a child core needs them.
+
+For GRE/IPIP, the embedded `layer3_helper.py` validates the assigned outer IPv4, private peer endpoints, interface ownership, route table and source policy. It pins the carrier to the discovered physical interface and adds an unreachable default only inside its private policy table. Native transports independently verify link state and the selected kernel route before dialing. An unrelated pre-existing interface is never replaced; the host default route is retained.
+
+For Paqet, the agent discovers the WAN route and next-hop neighbor MAC. It installs three comment-tagged rules restricted to one local address, peer and dedicated port. These bypass connection tracking and prevent kernel RST interference on that carrier. It does not flush any firewall table. The Paqet child runs under the service UID with NET_RAW/NET_ADMIN; Xray and Hysteria children have no such capabilities. Low public ports for Xray/Hysteria receive only NET_BIND_SERVICE.
+
+External cores are fixed release members verified during packaging and installation. They receive generated JSON, not user-supplied configuration files. The Iran core exposes an ephemeral loopback SOCKS5 listener. The overseas native HESAR listener binds loopback. Xray routing and `finalRules` allow only its authenticated TCP destination `127.0.0.1:<native-port>`. Paqet and Hysteria use their upstream authenticated proxy implementations; keep their shared credentials private.
+
+Start provisions a carrier before opening the native transport. Stop closes native connections before releasing the child process, owned link and tagged rules. Failed cleanup is reported and a later Stop/Delete retries release. The root registry permits recovery after interruption, including partial L3 teardown with an ownership marker. Inner addresses use `noprefixroute` to avoid installing a peer route in the host main table. Conflicting existing host addresses are rejected. The agent reports systemd readiness after its Unix socket is ready. Systemd stops the panel before the agent and groups the agent's children for cleanup; active persisted tunnels are provisioned again when HESAR restarts.
+
+The native channel keeps its existing authenticated X25519 exchange and ChaCha20-Poly1305 records. TLS certificates are verified. Native QUIC uses PSK-derived pinned peer certificates and a custom ALPN. Auto falls back during setup before application bytes are sent; it does not replay application data or migrate active sessions.
+
+`wss-shaped` adds a bounded length/padding envelope inside the TLS WebSocket stream. It is an experimental traffic-shaping format, not new cryptography or browser emulation. Padding does not remove ClientHello, timing, IP or connection fingerprints. Both peers must select the shaped transport; changing a transport closes existing sessions.
+
+Private certificates generated in the panel last 90 days. They provide explicit peer trust, not public website identity. Peer export includes shared keys and certificate trust while removing the server's TLS and REALITY private keys. List/save responses mask secrets; an unchanged masked edit preserves the stored values. Authentication and credential-bearing replies are `no-store`.
+
+GitHub Actions builds the SPA, both Go executables and complete Linux amd64/arm64 bundles. Core versions and upstream asset SHA-256 values are pinned in `fetch-release-cores.py`; each bundle records binary digests, licenses and source links. Tag releases sign the outer manifest and installer. Offline checksum validation establishes integrity, not publisher authenticity.
+
+The installer validates allowlisted regular archive members and all runtime digests before switching a versioned bundle symlink. It keeps application configuration and previous generations. Unsupported systemd/OS/runtime prerequisites fail explicitly. There is no production compilation or protocol-specific setup script to execute on the servers.
+
+Tests run in temporary directories and isolated Linux network namespaces, including default INPUT/OUTPUT DROP policies: actual GRE/IPIP links, route/link refusal, three real cores, API peer export/import, masked active edits, data integrity and teardown. They do not measure Iran censorship or certify resistance to DPI. Provider ACLs, incompatible NAT and external reachability remain outside local provisioning.

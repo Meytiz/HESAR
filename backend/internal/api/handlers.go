@@ -1,18 +1,22 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Meytiz/HESAR/backend/internal/config"
+	"github.com/Meytiz/HESAR/backend/internal/provision"
 	"github.com/Meytiz/HESAR/backend/internal/system"
 	"github.com/Meytiz/HESAR/backend/internal/tunnel"
 	"github.com/Meytiz/HESAR/backend/internal/tunnel/crypto"
@@ -143,8 +147,13 @@ const maxJSONBodyBytes = 1 << 20 // 1 MiB is far beyond any legitimate panel req
 // decoding. Returns false (after writing an error response) on any failure.
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, v interface{}) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(v); err != nil {
 		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return false
+	}
+	if err := decoder.Decode(new(interface{})); err != io.EOF {
+		jsonError(w, "request body must contain exactly one JSON value", http.StatusBadRequest)
 		return false
 	}
 	return true
@@ -191,11 +200,13 @@ func ConfigGetHandler(w http.ResponseWriter, r *http.Request) {
 	cfg.AdminPassword = ""
 	cfg.SecretKey = ""
 	for _, t := range cfg.Tunnels {
-		t.EncryptionKey = maskKey(t.EncryptionKey)
+		redactTransportSecrets(t)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(cfg)
 }
+
+var settingsUpdateMu sync.Mutex
 
 func ConfigUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -212,41 +223,33 @@ func ConfigUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSONBody(w, r, &req) {
 		return
 	}
-	if err := config.GlobalConfig.UpdateSettings(req.AdminUsername, req.AdminPassword, req.LogPath, req.LogMaxSizeMB); err != nil {
-		jsonError(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	// Credential change ⇒ kill every live session: rotate the JWT signing
-	// key so all previously issued tokens stop validating immediately.
-	if req.AdminPassword != "" {
-		if err := config.GlobalConfig.RotateSecretKey(); err != nil {
-			jsonError(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		system.LogWarn("GUI password changed — JWT signing key rotated; all sessions invalidated")
-	}
+	settingsUpdateMu.Lock()
+	defer settingsUpdateMu.Unlock()
 	if req.AllowedOrigins != nil {
-		for _, o := range req.AllowedOrigins {
-			if err := validateOriginEntry(o); err != nil {
+		for _, origin := range req.AllowedOrigins {
+			if err := validateOriginEntry(origin); err != nil {
 				jsonError(w, err.Error(), http.StatusBadRequest)
 				return
 			}
 		}
-		if err := config.GlobalConfig.SetAllowedOrigins(req.AllowedOrigins); err != nil {
-			jsonError(w, err.Error(), http.StatusInternalServerError)
+	}
+	var oldLogPath string
+	var oldLogSize int
+	if system.GlobalLogger != nil {
+		oldLogPath, oldLogSize = system.GlobalLogger.Settings()
+		if err := system.GlobalLogger.UpdateConfig(req.LogPath, req.LogMaxSizeMB); err != nil {
+			jsonError(w, fmt.Sprintf("cannot apply log settings: %v", err), http.StatusBadRequest)
 			return
 		}
-		system.LogInfo("GUI Allowed WebSocket origins updated (%d entries)", len(req.AllowedOrigins))
 	}
-	// Apply the new logging settings to the live logger. UpdateConfig treats
-	// an empty path / non-positive size as "unchanged", so partial submits are
-	// safe; a failure here must be VISIBLE (the operator is reading the very
-	// log stream that just refused to move) but is never fatal: the config is
-	// already saved and the old log target keeps working.
-	if system.GlobalLogger != nil {
-		if err := system.GlobalLogger.UpdateConfig(req.LogPath, req.LogMaxSizeMB); err != nil {
-			system.LogWarn("Settings saved, but logging could not be switched to %q: %v (keeping the previous log target)", req.LogPath, err)
+	if err := config.GlobalConfig.UpdatePanelSettings(req.AdminUsername, req.AdminPassword, req.LogPath, req.LogMaxSizeMB, req.AllowedOrigins); err != nil {
+		if system.GlobalLogger != nil {
+			if rollbackErr := system.GlobalLogger.UpdateConfig(oldLogPath, oldLogSize); rollbackErr != nil {
+				err = fmt.Errorf("%w; cannot restore log settings: %v", err, rollbackErr)
+			}
 		}
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 	system.LogInfo("GUI Settings updated successfully")
 	w.Header().Set("Content-Type", "application/json")
@@ -260,7 +263,7 @@ func TunnelsListHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	tunnels := config.GlobalConfig.GetTunnels()
 	for _, t := range tunnels {
-		t.EncryptionKey = maskKey(t.EncryptionKey)
+		redactTransportSecrets(t)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(tunnels)
@@ -294,12 +297,20 @@ func TunnelSaveHandler(w http.ResponseWriter, r *http.Request) {
 		if isMaskedKey(t.EncryptionKey) {
 			t.EncryptionKey = "" // keep the stored key (masked value echoed back)
 		}
-		if err := config.GlobalConfig.UpdateTunnel(&t); err != nil {
+		previous, err := config.GlobalConfig.GetTunnel(t.ID)
+		if err != nil {
+			writeConfigError(w, err)
+			return
+		}
+		preserveTransportSecrets(&t, previous)
+		if err := tunnel.GlobalTunnelManager.UpdateTunnel(&t); err != nil {
 			writeConfigError(w, err)
 			return
 		}
 	}
 	system.LogInfo("Tunnel [%s] saved successfully", t.Name)
+	redactTransportSecrets(&t)
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(t)
 }
@@ -314,7 +325,10 @@ func TunnelDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid tunnel ID", http.StatusBadRequest)
 		return
 	}
-	_ = tunnel.GlobalTunnelManager.StopTunnel(id)
+	if err := tunnel.GlobalTunnelManager.StopTunnel(id); err != nil {
+		writeConfigError(w, err)
+		return
+	}
 	if err := config.GlobalConfig.DeleteTunnel(id); err != nil {
 		if errors.Is(err, config.ErrTunnelNotFound) {
 			jsonError(w, err.Error(), http.StatusNotFound)
@@ -401,24 +415,22 @@ func OptimizeExecHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var warnings []string
-
-	if err := system.EnableBBR(); err != nil {
-		warnings = append(warnings, fmt.Sprintf("BBR: %v", err))
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	reply, err := provision.Call(ctx, "optimize", provision.Request{})
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusServiceUnavailable)
+		return
 	}
+	warnings := reply.Warnings
+	bbrActive := reply.BBRActive
 
-	if err := system.OptimizeNetwork(); err != nil {
-		warnings = append(warnings, fmt.Sprintf("Network: %v", err))
-	}
-
-	bbrActive := system.CheckBBR()
-
-	if len(warnings) > 0 && !bbrActive {
+	if len(warnings) > 0 {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"success":    false,
 			"bbr_active": bbrActive,
-			"message":    "Optimization requires root. Run: sudo ./hesar.sh --optimize",
+			"message":    "Available settings applied through the network agent; inspect warnings for kernel limitations.",
 			"warnings":   warnings,
 		})
 		return
@@ -493,6 +505,15 @@ func TesterQUICHandler(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(res)
 }
 
+func NetworkProfilesHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(config.NetworkProfiles())
+}
+
 func KeyGenHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -523,6 +544,11 @@ func LogsWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	keyVersion := config.GlobalConfig.GetSecretKey()
+	stopClose := context.AfterFunc(r.Context(), func() { _ = conn.Close() })
+	defer stopClose()
+	conn.SetReadLimit(1024)
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	conn.SetPongHandler(func(string) error {
@@ -557,16 +583,26 @@ func LogsWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 
 	for {
 		select {
+		case <-r.Context().Done():
+			return
 		case <-done:
 			return
 		case <-ticker.C:
+			if config.GlobalConfig.GetSecretKey() != keyVersion {
+				return
+			}
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
 		case msg, ok := <-logCh:
+			if config.GlobalConfig.GetSecretKey() != keyVersion {
+				return
+			}
 			if !ok {
 				return
 			}
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := conn.WriteJSON(msg); err != nil {
 				return
 			}

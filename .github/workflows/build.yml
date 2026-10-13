@@ -1,224 +1,128 @@
 name: Build & Release HESAR
-
 on:
   push:
-    tags:
-      - 'v*'
-
+    tags: ['v*']
 permissions:
-  contents: write
-  id-token: write
-
-env:
-  # Must match the `go` directive in backend/go.mod (was stuck at 1.22
-  # while go.mod already required 1.25.0 — the build only worked because
-  # of implicit toolchain auto-download; making it explicit keeps CI and
-  # go.mod from silently drifting apart again).
-  GO_VERSION: '1.26.0'
-  NODE_VERSION: '22'
-
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  verify:
-    name: Vet, Staticcheck, Vulncheck
+  release:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: write
+      id-token: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
+          fetch-depth: 0
+      - name: Validate version tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || {
+            echo 'Expected a version tag such as v2.0.0 or v2.0.0-beta.1' >&2
+            exit 1
+          }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
           cache-dependency-path: frontend/package-lock.json
-
-      - name: Frontend install + typecheck
+      - name: Build and audit panel
         working-directory: frontend
-        run: |
-          npm ci
-          npm run typecheck
-
-      - name: Build frontend
-        working-directory: frontend
-        run: npm run build
-
-      # server.go embeds `dist/*` — on a fresh checkout the directory is
-      # empty and every Go tool (vet/staticcheck) fails with
-      # "pattern dist/*: no matching files found". Stage the built SPA
-      # before running any Go step.
-      - name: Stage embedded frontend for Go tooling
-        run: |
-          rm -rf backend/internal/api/dist
-          mkdir -p backend/internal/api/dist
-          cp -r frontend/dist/* backend/internal/api/dist/
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: backend/go.sum
-
-      - name: Go vet
-        working-directory: backend
-        run: go vet ./...
-
-      - name: staticcheck
-        uses: dominikh/staticcheck-action@v1
-        with:
-          version: latest
-          working-directory: backend
-
-      - name: govulncheck
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          cd backend && govulncheck ./...
-
-  build:
-    name: Build All
-    runs-on: ubuntu-latest
-    needs: verify
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install frontend dependencies
-        working-directory: frontend
-        run: npm ci
-
-      - name: Build frontend
-        working-directory: frontend
-        run: npm run build
         env:
           VITE_APP_VERSION: ${{ github.ref_name }}
-
-      # The panel embeds the built SPA, so a broken frontend must fail the
-      # release pipeline BEFORE the Go binary is produced.
-      - name: Verify embedded frontend exists
-        run: test -f frontend/dist/index.html
-
-      - name: Copy frontend to backend
         run: |
-          rm -rf backend/internal/api/dist
-          cp -r frontend/dist backend/internal/api/dist
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+          npm ci
+          npm run build
+          npm audit --audit-level=moderate
+      - name: Stage embedded panel
+        run: cp -R frontend/dist/. backend/internal/api/dist/
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: '1.26.x'
           cache-dependency-path: backend/go.sum
-
-      - name: Build Linux amd64
+      - name: Test and vet
         working-directory: backend
-        env:
-          GOOS: linux
-          GOARCH: amd64
-          CGO_ENABLED: '0'
         run: |
-          go build \
-            -ldflags="-s -w -X main.Version=${{ github.ref_name }} -X main.BuildDate=$(date +%Y-%m-%d)" \
-            -o ../release/hesar-linux-amd64 \
-            cmd/hesar/main.go
-
-      - name: Build Linux arm64
+          go test -race ./...
+          go vet ./...
+      - name: Staticcheck and vulnerability scan
         working-directory: backend
-        env:
-          GOOS: linux
-          GOARCH: arm64
-          CGO_ENABLED: '0'
         run: |
-          go build \
-            -ldflags="-s -w -X main.Version=${{ github.ref_name }} -X main.BuildDate=$(date +%Y-%m-%d)" \
-            -o ../release/hesar-linux-arm64 \
-            cmd/hesar/main.go
-
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: Prepare release assets
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
+          staticcheck ./...
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          govulncheck ./...
+      - name: Check scripts
         run: |
-          mkdir -p release
-
-          cp scripts/hesar.sh release/
-          cp README.md release/
-          cp LICENSE release/
-
-          # Keep hesar.sh's displayed VERSION in perfect sync with the
-          # git tag this release was built from.
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          sed -i "s/^VERSION=\".*\"/VERSION=\"${TAG_VERSION}\"/" release/hesar.sh
-
-          cd release
-          tar -czf ../hesar-linux-amd64.tar.gz hesar-linux-amd64 hesar.sh README.md LICENSE
-          tar -czf ../hesar-linux-arm64.tar.gz hesar-linux-arm64 hesar.sh README.md LICENSE
-          cd ..
-
-          sha256sum release/hesar-linux-amd64 release/hesar-linux-arm64 release/hesar.sh > checksums-sha256.txt
-
-      - name: Sign checksum manifest and install script (cosign keyless)
+          bash -n scripts/install-hesar.sh scripts/build-linux-release.sh scripts/test-release-installer.sh
+          python3 -m py_compile scripts/fetch-release-cores.py scripts/package-linux-release.py scripts/test-linux-layer3.py scripts/test-managed-transports.py backend/internal/provision/layer3_helper.py
+      - name: Build and package both Linux architectures
         env:
-          COSIGN_EXPERIMENTAL: '1'
+          BUILD_VERSION: ${{ github.ref_name }}
+          HESAR_REPOSITORY: ${{ github.repository }}
+        run: bash scripts/build-linux-release.sh
+      - name: Validate installer against artifacts
+        run: sudo bash scripts/test-release-installer.sh
+      - name: Test GRE and IPIP with TCP, QUIC and KCP
+        run: sudo python3 scripts/test-linux-layer3.py
+      - name: Test panel-managed carriers and peer setup
+        run: sudo python3 scripts/test-managed-transports.py
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
+      - name: Sign manifest and installer
+        working-directory: release
         run: |
           cosign sign-blob --yes \
+            --bundle checksums-sha256.txt.sigstore.json checksums-sha256.txt
+          cosign sign-blob --yes \
+            --bundle install-hesar.sh.sigstore.json install-hesar.sh
+          # Compatibility assets for installations using older Cosign.
+          cosign sign-blob --yes --use-signing-config=false --new-bundle-format=false \
             --output-signature checksums-sha256.txt.sig \
-            --output-certificate checksums-sha256.txt.pem \
-            checksums-sha256.txt
-
-          cosign sign-blob --yes \
-            --output-signature release/hesar.sh.sig \
-            --output-certificate release/hesar.sh.pem \
-            release/hesar.sh
-
-      - name: Generate changelog
+            --output-certificate checksums-sha256.txt.pem checksums-sha256.txt
+          cosign sign-blob --yes --use-signing-config=false --new-bundle-format=false \
+            --output-signature install-hesar.sh.sig \
+            --output-certificate install-hesar.sh.pem install-hesar.sh
+      - name: Generate release notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          HESAR_REPOSITORY: ${{ github.repository }}
         run: |
-          PREV_TAG=$(git tag --sort=-version:refname | sed -n '2p')
-          echo "## What's Changed" > CHANGELOG.md
-          echo "" >> CHANGELOG.md
-          if [ -z "$PREV_TAG" ]; then
-            echo "Initial release of HESAR Anti-DPI Tunnel Suite." >> CHANGELOG.md
-          else
-            git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" >> CHANGELOG.md
-          fi
-          echo "" >> CHANGELOG.md
-          echo "" >> CHANGELOG.md
-          echo "## Quick Install" >> CHANGELOG.md
-          echo '```bash' >> CHANGELOG.md
-          echo 'bash <(curl -fsSL https://raw.githubusercontent.com/Meytiz/HESAR/main/scripts/hesar.sh)' >> CHANGELOG.md
-          echo '```' >> CHANGELOG.md
-          echo "" >> CHANGELOG.md
-          echo "## Verification" >> CHANGELOG.md
-          echo "Binaries and hesar.sh are hashed in checksums-sha256.txt, signed keylessly via cosign/Sigstore (GitHub Actions OIDC identity)." >> CHANGELOG.md
-          echo '```bash' >> CHANGELOG.md
-          echo 'cosign verify-blob \\' >> CHANGELOG.md
-          echo '  --certificate checksums-sha256.txt.pem \\' >> CHANGELOG.md
-          echo '  --signature checksums-sha256.txt.sig \\' >> CHANGELOG.md
-          echo '  --certificate-identity-regexp "^https://github.com/Meytiz/HESAR/.github/workflows/build.yml@refs/tags/.*$" \\' >> CHANGELOG.md
-          echo '  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \\' >> CHANGELOG.md
-          echo '  checksums-sha256.txt' >> CHANGELOG.md
-          echo '```' >> CHANGELOG.md
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+          PREV_TAG=$(git describe --tags --match 'v*' --abbrev=0 HEAD^ 2>/dev/null || true)
+          {
+            printf '## Changes\n\n'
+            if [ -n "$PREV_TAG" ]; then
+              git log "$PREV_TAG..HEAD" --pretty=format:'- %s (%h)'
+            else
+              printf 'Initial release of this HESAR edition.\n'
+            fi
+            printf '\n\nManagement panel: HTTP. Application traffic: TCP.\n'
+            printf '\nDownload install-hesar.sh, the matching Linux archive and checksums-sha256.txt together.\n'
+            printf '\nPanel setup instructions and pinned core licenses are included in each archive.\n'
+            printf '\nBinary and archive hashes are signed with Sigstore using this repository tag workflow identity.\n'
+          } > CHANGELOG.md
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ github.ref_name }}
-          name: "HESAR ${{ github.ref_name }}"
+          name: HESAR ${{ github.ref_name }}
           body_path: CHANGELOG.md
-          draft: false
-          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
-            release/hesar-linux-amd64
-            release/hesar-linux-arm64
-            hesar-linux-amd64.tar.gz
-            hesar-linux-arm64.tar.gz
-            checksums-sha256.txt
-            checksums-sha256.txt.sig
-            checksums-sha256.txt.pem
-            release/hesar.sh
-            release/hesar.sh.sig
-            release/hesar.sh.pem
+            release/hesar-linux-amd64.tar.gz
+            release/hesar-linux-arm64.tar.gz
+            release/checksums-sha256.txt
+            release/checksums-sha256.txt.sig
+            release/checksums-sha256.txt.pem
+            release/checksums-sha256.txt.sigstore.json
+            release/install-hesar.sh
+            release/install-hesar.sh.sig
+            release/install-hesar.sh.pem
+            release/install-hesar.sh.sigstore.json
+            release/BUILDINFO.json

@@ -118,7 +118,7 @@ func (l *Logger) rotateAndCleanup() {
 
 	var backups []string
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), base) && strings.HasSuffix(e.Name(), ".bak") {
+		if strings.HasPrefix(e.Name(), base+".") && strings.HasSuffix(e.Name(), ".bak") {
 			backups = append(backups, filepath.Join(dir, e.Name()))
 		}
 	}
@@ -193,6 +193,12 @@ func (l *Logger) UpdateConfig(filePath string, maxSizeMB int) error {
 		_ = oldFile.Close()
 	}
 	return nil
+}
+
+func (l *Logger) Settings() (string, int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.filePath, l.maxSizeMB
 }
 
 // Subscribe registers a new live-log subscriber and delivers a snapshot of
